@@ -37,6 +37,9 @@
  */
 #define WLCORE_NUM_MAC_ADDRESSES 3
 
+/* wl12xx/wl18xx maximum transmission power (in dBm) */
+#define WLCORE_MAX_TX_POWER        25
+
 /* forward declaration */
 struct wl1271_tx_hw_descr;
 enum wl_rx_buf_align;
@@ -87,6 +90,11 @@ struct wlcore_ops {
 		       struct ieee80211_sta *sta,
 		       struct ieee80211_key_conf *key_conf);
 	u32 (*pre_pkt_send)(struct wl1271 *wl, u32 buf_offset, u32 last_len);
+	int (*set_peer_cap)(struct wl1271 *wl,
+			    struct ieee80211_sta_ht_cap *ht_cap,
+			    bool allow_ht_operation,
+			    u32 rate_set, u8 hlid);
+	u32 (*convert_hwaddr)(struct wl1271 *wl, u32 hwaddr);
 };
 
 enum wlcore_partitions {
@@ -207,6 +215,8 @@ struct wl1271 {
 	unsigned long klv_templates_map[
 			BITS_TO_LONGS(WLCORE_MAX_KLV_TEMPLATES)];
 
+	u8 session_ids[WL12XX_MAX_LINKS];
+
 	struct list_head wlvif_list;
 
 	u8 sta_count;
@@ -267,6 +277,12 @@ struct wl1271 {
 	/* Number of valid bytes in the FW log buffer */
 	ssize_t fwlog_size;
 
+	/* FW log end marker */
+	u32 fwlog_end;
+
+	/* FW memory block size */
+	u32 fw_mem_block_size;
+
 	/* Sysfs FW log entry readers wait queue */
 	wait_queue_head_t fwlog_waitq;
 
@@ -287,9 +303,6 @@ struct wl1271 {
 	struct ieee80211_vif *scan_vif;
 	struct wl1271_scan scan;
 	struct delayed_work scan_complete_work;
-
-	/* Connection loss work */
-	struct delayed_work connection_loss_work;
 
 	struct ieee80211_vif *roc_vif;
 	struct delayed_work roc_complete_work;
@@ -347,6 +360,9 @@ struct wl1271 {
 	 * are always active.
 	 */
 	struct wl1271_link links[WL12XX_MAX_LINKS];
+
+	/* Fast/slow links bitmap according to FW */
+	u32 fw_fast_lnk_map;
 
 	/* AP-mode - a bitmap of links currently in PS mode according to FW */
 	u32 ap_fw_ps_map;

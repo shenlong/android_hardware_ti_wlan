@@ -210,6 +210,8 @@ static struct wlcore_conf wl12xx_conf = {
 		.tmpl_short_retry_limit      = 10,
 		.tmpl_long_retry_limit       = 10,
 		.tx_watchdog_timeout         = 5000,
+		.slow_link_thold             = 3,
+		.fast_link_thold             = 10,
 	},
 	.conn = {
 		.wake_up_event               = CONF_WAKE_UP_EVENT_DTIM,
@@ -329,11 +331,11 @@ static struct wlcore_conf wl12xx_conf = {
 		.always                        = 0,
 	},
 	.fwlog = {
-		.mode                         = WL12XX_FWLOG_ON_DEMAND,
+		.mode                         = WL12XX_FWLOG_CONTINUOUS,
 		.mem_blocks                   = 2,
 		.severity                     = 0,
 		.timestamp                    = WL12XX_FWLOG_TIMESTAMP_DISABLED,
-		.output                       = WL12XX_FWLOG_OUTPUT_HOST,
+		.output                       = WL12XX_FWLOG_OUTPUT_DBG_PINS,
 		.threshold                    = 0,
 	},
 	.rate = {
@@ -700,6 +702,9 @@ static int wl12xx_identify_chip(struct wl1271 *wl)
 		ret = -ENODEV;
 		goto out;
 	}
+
+	wl->fw_mem_block_size = 256;
+	wl->fwlog_end = 0x2000000;
 
 out:
 	return ret;
@@ -1595,6 +1600,20 @@ static int wl12xx_set_key(struct wl1271 *wl, enum set_key_cmd cmd,
 	return wlcore_set_key(wl, cmd, vif, sta, key_conf);
 }
 
+static int wl12xx_set_peer_cap(struct wl1271 *wl,
+			       struct ieee80211_sta_ht_cap *ht_cap,
+			       bool allow_ht_operation,
+			       u32 rate_set, u8 hlid)
+{
+	return wl1271_acx_set_ht_capabilities(wl, ht_cap, allow_ht_operation,
+					      hlid);
+}
+
+static u32 wl12xx_convert_hwaddr(struct wl1271 *wl, u32 hwaddr)
+{
+	return hwaddr << 5;
+}
+
 static struct wlcore_ops wl12xx_ops = {
 	.identify_chip		= wl12xx_identify_chip,
 	.identify_fw		= wl12xx_identify_fw,
@@ -1621,6 +1640,8 @@ static struct wlcore_ops wl12xx_ops = {
 	.get_spare_blocks	= wl12xx_get_spare_blocks,
 	.set_key		= wl12xx_set_key,
 	.pre_pkt_send		= NULL,
+	.set_peer_cap		= wl12xx_set_peer_cap,
+	.convert_hwaddr = wl12xx_convert_hwaddr,
 };
 
 static struct ieee80211_sta_ht_cap wl12xx_ht_cap = {

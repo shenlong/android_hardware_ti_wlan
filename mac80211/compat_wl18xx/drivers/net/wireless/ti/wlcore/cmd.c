@@ -220,20 +220,6 @@ out:
 	return ret;
 }
 
-static int wl1271_cmd_wait_for_event(struct wl1271 *wl, u32 mask)
-{
-	int ret;
-	bool timeout = false;
-
-	ret = wl1271_cmd_wait_for_event_or_timeout(wl, mask, &timeout);
-	if (ret != 0 || timeout) {
-		wl12xx_queue_recovery_work(wl);
-		return ret;
-	}
-
-	return 0;
-}
-
 int wl12xx_cmd_role_enable(struct wl1271 *wl, u8 *addr, u8 role_type,
 			   u8 *role_id)
 {
@@ -310,6 +296,16 @@ out:
 	return ret;
 }
 
+static int wlcore_get_new_session_id(struct wl1271 *wl, u8 hlid)
+{
+	if (wl->session_ids[hlid] >= SESSION_COUNTER_MAX)
+		wl->session_ids[hlid] = 0;
+
+	wl->session_ids[hlid]++;
+
+	return wl->session_ids[hlid];
+}
+
 int wl12xx_allocate_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid)
 {
 	unsigned long flags;
@@ -317,11 +313,18 @@ int wl12xx_allocate_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid)
 	if (link >= WL12XX_MAX_LINKS)
 		return -EBUSY;
 
+	wl->session_ids[link] = wlcore_get_new_session_id(wl, link);
+
 	/* these bits are used by op_tx */
 	spin_lock_irqsave(&wl->wl_lock, flags);
 	__set_bit(link, wl->links_map);
 	__set_bit(link, wlvif->links_map);
 	spin_unlock_irqrestore(&wl->wl_lock, flags);
+
+	/* take the last "freed packets" value from the current FW status */
+	wl->links[link].prev_freed_pkts =
+			wl->fw_status_2->counters.tx_lnk_free_pkts[link];
+	wl->links[link].wlvif = wlvif;
 	*hlid = link;
 	return 0;
 }
@@ -339,24 +342,19 @@ void wl12xx_free_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid)
 	__clear_bit(*hlid, wlvif->links_map);
 	spin_unlock_irqrestore(&wl->wl_lock, flags);
 
+	wl->links[*hlid].allocated_pkts = 0;
+	wl->links[*hlid].prev_freed_pkts = 0;
+	wl->links[*hlid].ba_bitmap = 0;
+	memset(wl->links[*hlid].addr, 0, ETH_ALEN);
+
 	/*
 	 * At this point op_tx() will not add more packets to the queues. We
 	 * can purge them.
 	 */
 	wl1271_tx_reset_link_queues(wl, *hlid);
+	wl->links[*hlid].wlvif = NULL;
 
 	*hlid = WL12XX_INVALID_LINK_ID;
-}
-
-static int wl12xx_get_new_session_id(struct wl1271 *wl,
-				     struct wl12xx_vif *wlvif)
-{
-	if (wlvif->session_counter >= SESSION_COUNTER_MAX)
-		wlvif->session_counter = 0;
-
-	wlvif->session_counter++;
-
-	return wlvif->session_counter;
 }
 
 static u8 wlcore_get_native_channel_type(u8 nl_channel_type)
@@ -403,7 +401,7 @@ static int wl12xx_cmd_role_start_dev(struct wl1271 *wl,
 			goto out_free;
 	}
 	cmd->device.hlid = wlvif->dev_hlid;
-	cmd->device.session = wl12xx_get_new_session_id(wl, wlvif);
+	cmd->device.session = wl->session_ids[wlvif->dev_hlid];
 
 	wl1271_debug(DEBUG_CMD, "role start: roleid=%d, hlid=%d, session=%d",
 		     cmd->role_id, cmd->device.hlid, cmd->device.session);
@@ -451,12 +449,6 @@ static int wl12xx_cmd_role_stop_dev(struct wl1271 *wl,
 	ret = wl1271_cmd_send(wl, CMD_ROLE_STOP, cmd, sizeof(*cmd), 0);
 	if (ret < 0) {
 		wl1271_error("failed to initiate cmd role stop");
-		goto out_free;
-	}
-
-	ret = wl1271_cmd_wait_for_event(wl, ROLE_STOP_COMPLETE_EVENT_ID);
-	if (ret < 0) {
-		wl1271_error("cmd role stop dev event completion error");
 		goto out_free;
 	}
 
@@ -510,13 +502,12 @@ int wl12xx_cmd_role_start_sta(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 			goto out_free;
 	}
 	cmd->sta.hlid = wlvif->sta.hlid;
-	cmd->sta.session = wl12xx_get_new_session_id(wl, wlvif);
+	cmd->sta.session = wl->session_ids[wlvif->sta.hlid];
 	/*
-	 * We don't have the correct remote rates in this stage, and there
-	 * is no way to update them later, so use our supported rates instead.
-	 * The fw will take the configured rate policies into account anyway.
+	 * We don't have the correct remote rates in this stage. the rates
+	 * will be reconfigured later, after authorization.
 	 */
-	cmd->sta.remote_rates = cpu_to_le32(supported_rates);
+	cmd->sta.remote_rates = cpu_to_le32(wlvif->rate_set);
 
 	wl1271_debug(DEBUG_CMD, "role start: roleid=%d, hlid=%d, session=%d "
 		     "basic_rate_set: 0x%x, remote_rates: 0x%x",
@@ -550,7 +541,6 @@ int wl12xx_cmd_role_stop_sta(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 {
 	struct wl12xx_cmd_role_stop *cmd;
 	int ret;
-	bool timeout = false;
 
 	if (WARN_ON(wlvif->sta.hlid == WL12XX_INVALID_LINK_ID))
 		return -EINVAL;
@@ -572,17 +562,6 @@ int wl12xx_cmd_role_stop_sta(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 		wl1271_error("failed to initiate cmd role stop sta");
 		goto out_free;
 	}
-
-	/*
-	 * Sometimes the firmware doesn't send this event, so we just
-	 * time out without failing.  Queue recovery for other
-	 * failures.
-	 */
-	ret = wl1271_cmd_wait_for_event_or_timeout(wl,
-						   ROLE_STOP_COMPLETE_EVENT_ID,
-						   &timeout);
-	if (ret)
-		wl12xx_queue_recovery_work(wl);
 
 	wl12xx_free_link(wl, wlvif, &wlvif->sta.hlid);
 
@@ -629,6 +608,8 @@ int wl12xx_cmd_role_start_ap(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 	cmd->ap.bss_index = WL1271_AP_BSS_INDEX;
 	cmd->ap.global_hlid = wlvif->ap.global_hlid;
 	cmd->ap.broadcast_hlid = wlvif->ap.bcast_hlid;
+	cmd->ap.global_session_id = wl->session_ids[wlvif->ap.global_hlid];
+	cmd->ap.bcast_session_id = wl->session_ids[wlvif->ap.bcast_hlid];
 	cmd->ap.basic_rate_set = cpu_to_le32(wlvif->basic_rate_set);
 	cmd->ap.beacon_interval = cpu_to_le16(wlvif->beacon_int);
 	cmd->ap.dtim_interval = bss_conf->dtim_period;
@@ -1502,6 +1483,7 @@ int wl12xx_cmd_add_peer(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 	cmd->hlid = hlid;
 	cmd->sp_len = sta->max_sp;
 	cmd->wmm = sta->wme ? 1 : 0;
+	cmd->session_id = wl->session_ids[hlid];
 
 	for (i = 0; i < NUM_ACCESS_CATEGORIES_COPY; i++)
 		if (sta->wme && (sta->uapsd_queues & BIT(i)))
@@ -1792,6 +1774,7 @@ int wl12xx_cmd_channel_switch(struct wl1271 *wl,
 			      struct ieee80211_channel_switch *ch_switch)
 {
 	struct wl12xx_cmd_channel_switch *cmd;
+	u32 supported_rates;
 	int ret;
 
 	wl1271_debug(DEBUG_ACX, "cmd channel switch");
@@ -1806,9 +1789,15 @@ int wl12xx_cmd_channel_switch(struct wl1271 *wl,
 	cmd->channel = ch_switch->channel->hw_value;
 	cmd->switch_time = ch_switch->count;
 	cmd->stop_tx = ch_switch->block_tx;
+	if (ch_switch->channel->band == IEEE80211_BAND_5GHZ)
+		cmd->band = WLCORE_BAND_5GHZ;
 
-	/* FIXME: control from mac80211 in the future */
-	cmd->post_switch_tx_disable = 0;  /* Enable TX on the target channel */
+	supported_rates = CONF_TX_AP_ENABLED_RATES | CONF_TX_MCS_RATES |
+			  wlcore_hw_sta_get_ap_rate_mask(wl, wlvif);
+	if (wlvif->p2p)
+		supported_rates &= ~CONF_TX_CCK_RATES;
+	cmd->local_supported_rates = cpu_to_le32(supported_rates);
+	cmd->channel_type = wlvif->channel_type;
 
 	ret = wl1271_cmd_send(wl, CMD_CHANNEL_SWITCH, cmd, sizeof(*cmd), 0);
 	if (ret < 0) {
@@ -1823,7 +1812,7 @@ out:
 	return ret;
 }
 
-int wl12xx_cmd_stop_channel_switch(struct wl1271 *wl)
+int wl12xx_cmd_stop_channel_switch(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 {
 	struct wl12xx_cmd_stop_channel_switch *cmd;
 	int ret;
@@ -1835,6 +1824,8 @@ int wl12xx_cmd_stop_channel_switch(struct wl1271 *wl)
 		ret = -ENOMEM;
 		goto out;
 	}
+
+	cmd->role_id = wlvif->role_id;
 
 	ret = wl1271_cmd_send(wl, CMD_STOP_CHANNEL_SWICTH, cmd, sizeof(*cmd), 0);
 	if (ret < 0) {

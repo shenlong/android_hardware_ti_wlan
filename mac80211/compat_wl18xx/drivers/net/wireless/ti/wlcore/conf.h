@@ -57,20 +57,49 @@ enum {
 };
 
 enum {
-	CONF_HW_RATE_INDEX_1MBPS   = 0,
-	CONF_HW_RATE_INDEX_2MBPS   = 1,
-	CONF_HW_RATE_INDEX_5_5MBPS = 2,
-	CONF_HW_RATE_INDEX_6MBPS   = 3,
-	CONF_HW_RATE_INDEX_9MBPS   = 4,
-	CONF_HW_RATE_INDEX_11MBPS  = 5,
-	CONF_HW_RATE_INDEX_12MBPS  = 6,
-	CONF_HW_RATE_INDEX_18MBPS  = 7,
-	CONF_HW_RATE_INDEX_22MBPS  = 8,
-	CONF_HW_RATE_INDEX_24MBPS  = 9,
-	CONF_HW_RATE_INDEX_36MBPS  = 10,
-	CONF_HW_RATE_INDEX_48MBPS  = 11,
-	CONF_HW_RATE_INDEX_54MBPS  = 12,
-	CONF_HW_RATE_INDEX_MAX     = CONF_HW_RATE_INDEX_54MBPS,
+	CONF_HW_RATE_INDEX_1MBPS      = 0,
+	CONF_HW_RATE_INDEX_2MBPS      = 1,
+	CONF_HW_RATE_INDEX_5_5MBPS    = 2,
+	CONF_HW_RATE_INDEX_11MBPS     = 3,
+	CONF_HW_RATE_INDEX_6MBPS      = 4,
+	CONF_HW_RATE_INDEX_9MBPS      = 5,
+	CONF_HW_RATE_INDEX_12MBPS     = 6,
+	CONF_HW_RATE_INDEX_18MBPS     = 7,
+	CONF_HW_RATE_INDEX_24MBPS     = 8,
+	CONF_HW_RATE_INDEX_36MBPS     = 9,
+	CONF_HW_RATE_INDEX_48MBPS     = 10,
+	CONF_HW_RATE_INDEX_54MBPS     = 11,
+	CONF_HW_RATE_INDEX_MCS0       = 12,
+	CONF_HW_RATE_INDEX_MCS1       = 13,
+	CONF_HW_RATE_INDEX_MCS2       = 14,
+	CONF_HW_RATE_INDEX_MCS3       = 15,
+	CONF_HW_RATE_INDEX_MCS4       = 16,
+	CONF_HW_RATE_INDEX_MCS5       = 17,
+	CONF_HW_RATE_INDEX_MCS6       = 18,
+	CONF_HW_RATE_INDEX_MCS7       = 19,
+	CONF_HW_RATE_INDEX_MCS7_SGI   = 20,
+	CONF_HW_RATE_INDEX_MCS0_40MHZ = 21,
+	CONF_HW_RATE_INDEX_MCS1_40MHZ = 22,
+	CONF_HW_RATE_INDEX_MCS2_40MHZ = 23,
+	CONF_HW_RATE_INDEX_MCS3_40MHZ = 24,
+	CONF_HW_RATE_INDEX_MCS4_40MHZ = 25,
+	CONF_HW_RATE_INDEX_MCS5_40MHZ = 26,
+	CONF_HW_RATE_INDEX_MCS6_40MHZ = 27,
+	CONF_HW_RATE_INDEX_MCS7_40MHZ = 28,
+	CONF_HW_RATE_INDEX_MCS7_40MHZ_SGI = 29,
+
+	/* MCS8+ rates overlap with 40Mhz rates */
+	CONF_HW_RATE_INDEX_MCS8       = 21,
+	CONF_HW_RATE_INDEX_MCS9       = 22,
+	CONF_HW_RATE_INDEX_MCS10      = 23,
+	CONF_HW_RATE_INDEX_MCS11      = 24,
+	CONF_HW_RATE_INDEX_MCS12      = 25,
+	CONF_HW_RATE_INDEX_MCS13      = 26,
+	CONF_HW_RATE_INDEX_MCS14      = 27,
+	CONF_HW_RATE_INDEX_MCS15      = 28,
+	CONF_HW_RATE_INDEX_MCS15_SGI  = 29,
+
+	CONF_HW_RATE_INDEX_MAX        = CONF_HW_RATE_INDEX_MCS7_40MHZ_SGI,
 };
 
 #define CONF_HW_RXTX_RATE_UNSUPPORTED 0xff
@@ -677,6 +706,18 @@ struct conf_tx_settings {
 
 	/* Time in ms for Tx watchdog timer to expire */
 	u32 tx_watchdog_timeout;
+
+	/*
+	 * when a slow link has this much packets pending, it becomes a low
+	 * priority link, scheduling-wise
+	 */
+	u8 slow_link_thold;
+
+	/*
+	 * when a fast link has this much packets pending, it becomes a low
+	 * priority link, scheduling-wise
+	 */
+	u8 fast_link_thold;
 } __packed;
 
 enum {
@@ -1211,6 +1252,9 @@ struct conf_rx_streaming_settings {
 	u8 always;
 } __packed;
 
+#define CONF_FWLOG_MIN_MEM_BLOCKS 	2
+#define CONF_FWLOG_MAX_MEM_BLOCKS	16
+
 struct conf_fwlog {
 	/* Continuous or on-demand */
 	u8 mode;
@@ -1218,7 +1262,7 @@ struct conf_fwlog {
 	/*
 	 * Number of memory blocks dedicated for the FW logger
 	 *
-	 * Range: 1-3, or 0 to disable the FW logger
+	 * Range: 2-16, or 0 to disable the FW logger
 	 */
 	u8 mem_blocks;
 
@@ -1281,7 +1325,7 @@ struct conf_recovery_settings {
  * version, the two LSB are the lower driver's private conf
  * version.
  */
-#define WLCORE_CONF_VERSION	(0x0004 << 16)
+#define WLCORE_CONF_VERSION	(0x0005 << 16)
 #define WLCORE_CONF_MASK	0xffff0000
 #define WLCORE_CONF_SIZE	(sizeof(struct wlcore_conf_header) +	\
 				 sizeof(struct wlcore_conf))

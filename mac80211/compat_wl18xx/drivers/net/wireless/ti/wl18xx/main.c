@@ -336,6 +336,8 @@ static struct wlcore_conf wl18xx_conf = {
 		.tmpl_short_retry_limit      = 10,
 		.tmpl_long_retry_limit       = 10,
 		.tx_watchdog_timeout         = 5000,
+		.slow_link_thold             = 3,
+		.fast_link_thold             = 30,
 	},
 	.conn = {
 		.wake_up_event               = CONF_WAKE_UP_EVENT_DTIM,
@@ -450,11 +452,11 @@ static struct wlcore_conf wl18xx_conf = {
 		.always                        = 0,
 	},
 	.fwlog = {
-		.mode                         = WL12XX_FWLOG_ON_DEMAND,
+		.mode                         = WL12XX_FWLOG_CONTINUOUS,
 		.mem_blocks                   = 2,
 		.severity                     = 0,
 		.timestamp                    = WL12XX_FWLOG_TIMESTAMP_DISABLED,
-		.output                       = WL12XX_FWLOG_OUTPUT_HOST,
+		.output                       = WL12XX_FWLOG_OUTPUT_DBG_PINS,
 		.threshold                    = 0,
 	},
 	.rate = {
@@ -528,12 +530,18 @@ static struct wl18xx_priv_conf wl18xx_default_priv_conf = {
 		.low_power_val			= 0x00,
 		.med_power_val			= 0x0A,
 		.high_power_val			= 0x11,
+		.low_power_val_2nd		= 0x00,
+		.med_power_val_2nd		= 0x0A,
+		.high_power_val_2nd		= 0x11,
 		.external_pa_dc2dc		= 0,
 		.number_of_assembled_ant2_4	= 1,
 		.number_of_assembled_ant5	= 1,
 		.tx_rf_margin			= 1,
 	},
 };
+
+#define WL18XX_PHY_INIT_MEM_SIZE \
+	(WL18XX_PHY_END_MEM_ADDR - WL18XX_PHY_INIT_MEM_ADDR + 4)
 
 static const struct wlcore_partition_set wl18xx_ptable[PART_TABLE_LEN] = {
 	[PART_TOP_PRCM_ELP_SOC] = {
@@ -561,8 +569,8 @@ static const struct wlcore_partition_set wl18xx_ptable[PART_TABLE_LEN] = {
 		.mem3 = { .start = 0x00000000, .size  = 0x00000000 },
 	},
 	[PART_PHY_INIT] = {
-		.mem  = { .start = 0x80926000,
-			  .size = sizeof(struct wl18xx_mac_and_phy_params) },
+		.mem  = { .start = WL18XX_PHY_INIT_MEM_ADDR,
+			  .size = WL18XX_PHY_INIT_MEM_SIZE },
 		.reg  = { .start = 0x00000000, .size = 0x00000000 },
 		.mem2 = { .start = 0x00000000, .size = 0x00000000 },
 		.mem3 = { .start = 0x00000000, .size = 0x00000000 },
@@ -636,6 +644,9 @@ static int wl18xx_identify_chip(struct wl1271 *wl)
 		ret = -ENODEV;
 		goto out;
 	}
+
+	wl->fw_mem_block_size = 272;
+	wl->fwlog_end = 0x40000000;
 
 out:
 	return ret;
@@ -757,6 +768,9 @@ static int wl18xx_pre_upload(struct wl1271 *wl)
 	u32 tmp;
 	int ret;
 
+	BUILD_BUG_ON(sizeof(struct wl18xx_mac_and_phy_params) >
+		WL18XX_PHY_INIT_MEM_SIZE);
+
 	ret = wlcore_set_partition(wl, &wl->ptable[PART_BOOT]);
 	if (ret < 0)
 		goto out;
@@ -773,6 +787,30 @@ static int wl18xx_pre_upload(struct wl1271 *wl)
 	wl1271_debug(DEBUG_BOOT, "chip id 0x%x", tmp);
 
 	ret = wlcore_read32(wl, WL18XX_SCR_PAD2, &tmp);
+	if (ret < 0)
+		goto out;
+
+	/* Set ATPG clock toward FDSP Code RAM rather than its own clock */
+	/* Disable FDSP clock */
+
+	ret = wlcore_set_partition(wl, &wl->ptable[PART_PHY_INIT]);
+	if (ret < 0)
+		goto out;
+
+	ret = wlcore_write32(wl, WL18XX_PHY_FPGA_SPARE_1,
+			     MEM_FDSP_CLK_120_DISABLE);
+	if (ret < 0)
+		goto out;
+
+	/* Set ATPG clock toward FDSP Code RAM rather than its own clock */
+	ret = wlcore_write32(wl, WL18XX_PHY_FPGA_SPARE_1,
+			     MEM_FDSP_CODERAM_FUNC_CLK_SEL);
+	if (ret < 0)
+		goto out;
+
+	/* Re-enable FDSP clock */
+	ret = wlcore_write32(wl, WL18XX_PHY_FPGA_SPARE_1,
+			     MEM_FDSP_CLK_120_ENABLE);
 
 out:
 	return ret;
@@ -1313,6 +1351,20 @@ static int wl18xx_init_vif(struct wl1271* wl, struct wl12xx_vif *wlvif)
 	return 0;
 }
 
+static int wl18xx_set_peer_cap(struct wl1271 *wl,
+			       struct ieee80211_sta_ht_cap *ht_cap,
+			       bool allow_ht_operation,
+			       u32 rate_set, u8 hlid)
+{
+	return wl18xx_acx_set_peer_cap(wl, ht_cap, allow_ht_operation,
+				       rate_set, hlid);
+}
+
+static u32 wl18xx_convert_hwaddr(struct wl1271 *wl, u32 hwaddr)
+{
+	return hwaddr & ~0x80000000;
+}
+
 static struct wlcore_ops wl18xx_ops = {
 	.identify_chip	= wl18xx_identify_chip,
 	.boot		= wl18xx_boot,
@@ -1339,6 +1391,8 @@ static struct wlcore_ops wl18xx_ops = {
 	.set_key	= wl18xx_set_key,
 	.pre_pkt_send	= wl18xx_pre_pkt_send,
 	.init_vif	= wl18xx_init_vif,
+	.set_peer_cap	= wl18xx_set_peer_cap,
+	.convert_hwaddr = wl18xx_convert_hwaddr,
 };
 
 /* HT cap appropriate for wide channels in 2Ghz */

@@ -144,7 +144,10 @@ struct wl_fw_packet_counters {
 	/* Cumulative counter of released Voice memory blocks */
 	u8 tx_voice_released_blks;
 
-	u8 padding[3];
+	/* Tx rate of the last transmitted packet */
+	u8 tx_last_rate;
+
+	u8 padding[2];
 } __packed;
 
 /* FW status registers */
@@ -264,6 +267,8 @@ enum wl12xx_vif_flags {
 	WLVIF_FLAG_IN_USE,
 };
 
+struct wl12xx_vif;
+
 struct wl1271_link {
 	/* AP-mode - TX queue per AC in link */
 	struct sk_buff_head tx_queue[NUM_TX_QUEUES];
@@ -276,6 +281,9 @@ struct wl1271_link {
 
 	/* bitmap of TIDs where RX BA sessions are active for this link */
 	u8 ba_bitmap;
+
+	/* The wlvif this link belongs to. Might be null for global links */
+	struct wl12xx_vif *wlvif;
 };
 
 #define WL1271_MAX_RX_FILTERS 5
@@ -368,6 +376,9 @@ struct wl12xx_vif {
 	/* the hlid of the last transmitted skb */
 	int last_tx_hlid;
 
+	/* counters of packets per AC, across all links in the vif */
+	int tx_queue_count[NUM_TX_QUEUES];
+
 	unsigned long links_map[BITS_TO_LONGS(WL12XX_MAX_LINKS)];
 
 	u8 ssid[IEEE80211_MAX_SSID_LEN + 1];
@@ -402,9 +413,6 @@ struct wl12xx_vif {
 	/* Our association ID */
 	u16 aid;
 
-	/* Session counter for the chipset */
-	int session_counter;
-
 	/* retry counter for PSM entries */
 	u8 psm_entry_retry;
 
@@ -428,6 +436,9 @@ struct wl12xx_vif {
 	struct work_struct rx_streaming_enable_work;
 	struct work_struct rx_streaming_disable_work;
 	struct timer_list rx_streaming_timer;
+
+	struct delayed_work channel_switch_work;
+	struct delayed_work connection_loss_work;
 
 	bool pending_roc;
 
@@ -513,7 +524,5 @@ void wl1271_rx_filter_flatten_fields(struct wl12xx_rx_filter *filter,
 #define HW_BG_RATES_MASK	0xffff
 #define HW_HT_RATES_OFFSET	16
 #define HW_MIMO_RATES_OFFSET	24
-
-#define WL12XX_HW_BLOCK_SIZE	256
 
 #endif /* __WLCORE_I_H__ */

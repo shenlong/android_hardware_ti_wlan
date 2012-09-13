@@ -94,66 +94,82 @@ int wl12xx_cmd_stop_fwlog(struct wl1271 *wl);
 int wl12xx_cmd_channel_switch(struct wl1271 *wl,
 			      struct wl12xx_vif *wlvif,
 			      struct ieee80211_channel_switch *ch_switch);
-int wl12xx_cmd_stop_channel_switch(struct wl1271 *wl);
+int wl12xx_cmd_stop_channel_switch(struct wl1271 *wl,
+				   struct wl12xx_vif *wlvif);
 int wl12xx_allocate_link(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 			 u8 *hlid);
 void wl12xx_free_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid);
 
 enum wl1271_commands {
-	CMD_INTERROGATE	= 1, /* use this to read information elements */
-	CMD_CONFIGURE	= 2, /* use this to write information elements */
-	CMD_ENABLE_RX	= 3,
-	CMD_ENABLE_TX	= 4,
-	CMD_DISABLE_RX	= 5,
-	CMD_DISABLE_TX	= 6,
-	CMD_SCAN	= 7,
-	CMD_STOP_SCAN	= 8,
-	CMD_SET_KEYS	= 9,
-	CMD_READ_MEMORY	= 10,
+	CMD_INTERROGATE		= 1,
+	CMD_CONFIGURE		= 2,
+	CMD_ENABLE_RX		= 3,
+	CMD_ENABLE_TX		= 4,
+	CMD_DISABLE_RX		= 5,
+	CMD_DISABLE_TX		= 6,
+	CMD_SCAN		= 7,
+	CMD_STOP_SCAN		= 8,
+
+	CMD_SET_KEYS		= 9,
+	CMD_READ_MEMORY		= 10,
 	CMD_WRITE_MEMORY	= 11,
+
 	CMD_SET_TEMPLATE	= 12,
 	CMD_TEST		= 13,
+
 	CMD_NOISE_HIST		= 14,
 	CMD_QUIET_ELEMENT_SET_STATE = 15,
+
 	CMD_SET_BCN_MODE	= 16,
 
 	CMD_MEASUREMENT		= 17,
 	CMD_STOP_MEASUREMENT	= 18,
 	CMD_SET_PS_MODE		= 19,
+
 	CMD_CHANNEL_SWITCH	= 20,
-	CMD_STOP_CHANNEL_SWICTH = 21,
+	CMD_STOP_CHANNEL_SWICTH	= 21,
+
 	CMD_AP_DISCOVERY	= 22,
 	CMD_STOP_AP_DISCOVERY	= 23,
+
 	CMD_HEALTH_CHECK	= 24,
 	CMD_DEBUG		= 25,
-	CMD_CONNECTION_SCAN_SSID_CFG	= 26,
-	CMD_SET_PEER_STATE	= 27,
-	CMD_REMAIN_ON_CHANNEL	= 28,
-	CMD_CANCEL_REMAIN_ON_CHANNEL	= 29,
-	CMD_CONFIG_FWLOGGER		= 30,
-	CMD_START_FWLOGGER		= 31,
-	CMD_STOP_FWLOGGER		= 32,
+	CMD_TRIGGER_SCAN_TO	= 26,
+
+	CMD_CONNECTION_SCAN_CFG		= 27,
+	CMD_CONNECTION_SCAN_SSID_CFG	= 28,
+	CMD_START_PERIODIC_SCAN		= 29,
+	CMD_STOP_PERIODIC_SCAN		= 30,
+	CMD_SET_PEER_STATE		= 31,
+	CMD_REMAIN_ON_CHANNEL		= 32,
+	CMD_CANCEL_REMAIN_ON_CHANNEL	= 33,
+	CMD_CONFIG_FWLOGGER		= 34,
+	CMD_START_FWLOGGER		= 35,
+	CMD_STOP_FWLOGGER		= 36,
 
 	/* Access point commands */
-	CMD_ADD_PEER		= 33,
-	CMD_REMOVE_PEER		= 34,
+	CMD_ADD_PEER			= 37,
+	CMD_REMOVE_PEER			= 38,
 
 	/* Role API */
-	CMD_ROLE_ENABLE		= 35,
-	CMD_ROLE_DISABLE	= 36,
-	CMD_ROLE_START		= 37,
-	CMD_ROLE_STOP		= 38,
+	CMD_ROLE_ENABLE			= 39,
+	CMD_ROLE_DISABLE		= 40,
+	CMD_ROLE_START			= 41,
+	CMD_ROLE_STOP			= 42,
 
 	/* DFS */
-	CMD_START_RADAR_DETECTION	= 39,
-	CMD_STOP_RADAR_DETECTION	= 40,
+	CMD_START_RADAR_DETECTION	= 43,
+	CMD_STOP_RADAR_DETECTION	= 44,
 
 	/* WIFI Direct */
-	CMD_WFD_START_DISCOVERY	= 41,
-	CMD_WFD_STOP_DISCOVERY	= 42,
-	CMD_WFD_ATTRIBUTE_CONFIG	= 43,
-	CMD_NOP			= 44,
-	CMD_LAST_COMMAND,
+	CMD_WFD_START_DISCOVERY		= 45,
+	CMD_WFD_STOP_DISCOVERY		= 46,
+	CMD_WFD_ATTRIBUTE_CONFIG	= 47,
+	CMD_GENERIC_CFG			= 48,
+	CMD_NOP				= 49,
+
+	/* start of 18xx specific commands */
+	CMD_DFS_CHANNEL_CONFIG		= 60,
 
 	MAX_COMMAND_ID = 0xFFFF,
 };
@@ -357,7 +373,9 @@ struct wl12xx_cmd_role_start {
 			 */
 			u8 wmm;
 
-			u8 padding_1[3];
+			u8 bcast_session_id;
+			u8 global_session_id;
+			u8 padding_1[1];
 		} __packed ap;
 	};
 } __packed;
@@ -577,7 +595,7 @@ struct wl12xx_cmd_add_peer {
 	u8 bss_index;
 	u8 sp_len;
 	u8 wmm;
-	u8 padding1;
+	u8 session_id;
 } __packed;
 
 struct wl12xx_cmd_remove_peer {
@@ -656,14 +674,20 @@ struct wl12xx_cmd_channel_switch {
 	u8 switch_time;
 	/* Stop the role TX, should expect it after radar detection */
 	u8 stop_tx;
-	/* The target channel tx status 1-stopped 0-open*/
-	u8 post_switch_tx_disable;
 
-	u8 padding[3];
+	__le32 local_supported_rates;
+
+	u8 channel_type;
+	u8 band;
+
+	u8 padding[2];
 } __packed;
 
 struct wl12xx_cmd_stop_channel_switch {
 	struct wl1271_cmd_header header;
+
+	u8 role_id;
+	u8 padding[3];
 } __packed;
 
 /* Used to check radio status after calibration */

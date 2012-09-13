@@ -57,6 +57,7 @@
 #define WL1271_BOOT_RETRIES 3
 
 static char *fwlog_param;
+static int fwlog_mem_blocks = -1;
 static int bug_on_recovery = -1;
 static int no_recovery     = -1;
 
@@ -144,10 +145,9 @@ int wl1271_recalc_rx_streaming(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 	/* reconfigure/disable according to new streaming_period */
 	if (period &&
 	    test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags) &&
-	    (wl->conf.rx_streaming.always ||
-	     test_bit(WL1271_FLAG_SOFT_GEMINI, &wl->flags)))
+	    wl->conf.rx_streaming.always) {
 		ret = wl1271_set_rx_streaming(wl, wlvif, true);
-	else {
+	} else {
 		ret = wl1271_set_rx_streaming(wl, wlvif, false);
 		/* don't cancel_work_sync since we might deadlock */
 		del_timer_sync(&wlvif->rx_streaming_timer);
@@ -167,8 +167,7 @@ static void wl1271_rx_streaming_enable_work(struct work_struct *work)
 
 	if (test_bit(WLVIF_FLAG_RX_STREAMING_STARTED, &wlvif->flags) ||
 	    !test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags) ||
-	    (!wl->conf.rx_streaming.always &&
-	     !test_bit(WL1271_FLAG_SOFT_GEMINI, &wl->flags)))
+	    !wl->conf.rx_streaming.always)
 		goto out;
 
 	if (!wl->conf.rx_streaming.interval)
@@ -303,6 +302,18 @@ static void wlcore_adjust_conf(struct wl1271 *wl)
 {
 	/* Adjust settings according to optional module parameters */
 
+	/* Firmware Logger params */
+	if (fwlog_mem_blocks != -1) {
+		if (fwlog_mem_blocks >= CONF_FWLOG_MIN_MEM_BLOCKS &&
+		    fwlog_mem_blocks <= CONF_FWLOG_MAX_MEM_BLOCKS) {
+			wl->conf.fwlog.mem_blocks = fwlog_mem_blocks;
+		} else {
+			wl1271_error(
+				"Illegal fwlog_mem_blocks=%d using default %d",
+				fwlog_mem_blocks, wl->conf.fwlog.mem_blocks);
+		}
+	}
+
 	/* Firmware Log Settings */
 	if (fwlog_param) {
 		if (!strcmp(fwlog_param, "continuous")) {
@@ -357,11 +368,8 @@ static void wl12xx_irq_update_links_status(struct wl1271 *wl,
 					   struct wl12xx_vif *wlvif,
 					   struct wl_fw_status_2 *status)
 {
-	struct wl1271_link *lnk;
 	u32 cur_fw_ps_map;
-	u8 hlid, cnt;
-
-	/* TODO: also use link_fast_bitmap here */
+	u8 hlid;
 
 	cur_fw_ps_map = le32_to_cpu(status->link_ps_bitmap);
 	if (wl->ap_fw_ps_map != cur_fw_ps_map) {
@@ -373,17 +381,9 @@ static void wl12xx_irq_update_links_status(struct wl1271 *wl,
 		wl->ap_fw_ps_map = cur_fw_ps_map;
 	}
 
-	for_each_set_bit(hlid, wlvif->ap.sta_hlid_map, WL12XX_MAX_LINKS) {
-		lnk = &wl->links[hlid];
-		cnt = status->counters.tx_lnk_free_pkts[hlid] -
-			lnk->prev_freed_pkts;
-
-		lnk->prev_freed_pkts = status->counters.tx_lnk_free_pkts[hlid];
-		lnk->allocated_pkts -= cnt;
-
+	for_each_set_bit(hlid, wlvif->ap.sta_hlid_map, WL12XX_MAX_LINKS)
 		wl12xx_irq_ps_regulate_link(wl, wlvif, hlid,
-					    lnk->allocated_pkts);
-	}
+					    wl->links[hlid].allocated_pkts);
 }
 
 static int wlcore_fw_status(struct wl1271 *wl,
@@ -397,6 +397,7 @@ static int wlcore_fw_status(struct wl1271 *wl,
 	int i;
 	size_t status_len;
 	int ret;
+	struct wl1271_link *lnk;
 
 	status_len = WLCORE_FW_STATUS_1_LEN(wl->num_rx_desc) +
 		sizeof(*status_2) + wl->fw_status_priv_len;
@@ -420,6 +421,17 @@ static int wlcore_fw_status(struct wl1271 *wl,
 				wl->tx_pkts_freed[i]) & 0xff;
 
 		wl->tx_pkts_freed[i] = status_2->counters.tx_released_pkts[i];
+	}
+
+
+	for_each_set_bit(i, wl->links_map, WL12XX_MAX_LINKS) {
+		lnk = &wl->links[i];
+		/* prevent wrap-around in freed-packets counter */
+		lnk->allocated_pkts -=
+			(status_2->counters.tx_lnk_free_pkts[i] -
+			 lnk->prev_freed_pkts) & 0xff;
+
+		lnk->prev_freed_pkts = status_2->counters.tx_lnk_free_pkts[i];
 	}
 
 	/* prevent wrap-around in total blocks counter */
@@ -473,6 +485,8 @@ static int wlcore_fw_status(struct wl1271 *wl,
 	getnstimeofday(&ts);
 	wl->time_offset = (timespec_to_ns(&ts) >> 10) -
 		(s64)le32_to_cpu(status_2->fw_localtime);
+
+	wl->fw_fast_lnk_map = le32_to_cpu(status_2->link_fast_bitmap);
 
 	return 0;
 }
@@ -802,19 +816,10 @@ void wl12xx_queue_recovery_work(struct wl1271 *wl)
 
 size_t wl12xx_copy_fwlog(struct wl1271 *wl, u8 *memblock, size_t maxlen)
 {
-	size_t len = 0;
-
-	/* The FW log is a length-value list, find where the log end */
-	while (len < maxlen) {
-		if (memblock[len] == 0)
-			break;
-		if (len + memblock[len] + 1 > maxlen)
-			break;
-		len += memblock[len] + 1;
-	}
+	size_t len;
 
 	/* Make sure we have enough room */
-	len = min(len, (size_t)(PAGE_SIZE - wl->fwlog_size));
+	len = min(maxlen, (size_t)(PAGE_SIZE - wl->fwlog_size));
 
 	/* Fill the FW log file, consumed by the sysfs fwlog entry */
 	memcpy(wl->fwlog + wl->fwlog_size, memblock, len);
@@ -823,10 +828,9 @@ size_t wl12xx_copy_fwlog(struct wl1271 *wl, u8 *memblock, size_t maxlen)
 	return len;
 }
 
-#define WLCORE_FW_LOG_END 0x2000000
-
 static void wl12xx_read_fwlog_panic(struct wl1271 *wl)
 {
+	struct wlcore_partition_set part, old_part;
 	u32 addr;
 	u32 offset;
 	u32 end_of_log;
@@ -839,7 +843,7 @@ static void wl12xx_read_fwlog_panic(struct wl1271 *wl)
 
 	wl1271_info("Reading FW panic log");
 
-	block = kmalloc(WL12XX_HW_BLOCK_SIZE, GFP_KERNEL);
+	block = kmalloc(wl->fw_mem_block_size, GFP_KERNEL);
 	if (!block)
 		return;
 
@@ -865,17 +869,31 @@ static void wl12xx_read_fwlog_panic(struct wl1271 *wl)
 
 	if (wl->conf.fwlog.mode == WL12XX_FWLOG_CONTINUOUS) {
 		offset = sizeof(addr) + sizeof(struct wl1271_rx_descriptor);
-		end_of_log = WLCORE_FW_LOG_END;
+		end_of_log = wl->fwlog_end;
 	} else {
 		offset = sizeof(addr);
 		end_of_log = addr;
 	}
 
+	old_part = wl->curr_part;
+	memset(&part, 0, sizeof(part));
+
 	/* Traverse the memory blocks linked list */
 	do {
-		memset(block, 0, WL12XX_HW_BLOCK_SIZE);
-		ret = wlcore_read_hwaddr(wl, addr, block, WL12XX_HW_BLOCK_SIZE,
-					 false);
+		part.mem.start = wlcore_hw_convert_hwaddr(wl, addr);
+		part.mem.size  = PAGE_SIZE;
+
+		ret = wlcore_set_partition(wl, &part);
+		if (ret < 0) {
+			wl1271_error("%s: set_partition start=0x%X size=%d",
+				__func__, part.mem.start, part.mem.size);
+			goto out;
+		}
+
+		memset(block, 0, wl->fw_mem_block_size);
+		ret = wlcore_read_hwaddr(wl, addr, block,
+					wl->fw_mem_block_size, false);
+
 		if (ret < 0)
 			goto out;
 
@@ -886,8 +904,9 @@ static void wl12xx_read_fwlog_panic(struct wl1271 *wl)
 		 * on demand mode and is equal to 0x2000000 in continuous mode.
 		 */
 		addr = le32_to_cpup((__le32 *)block);
+
 		if (!wl12xx_copy_fwlog(wl, block + offset,
-				       WL12XX_HW_BLOCK_SIZE - offset))
+					wl->fw_mem_block_size - offset))
 			break;
 	} while (addr && (addr != end_of_log));
 
@@ -895,6 +914,7 @@ static void wl12xx_read_fwlog_panic(struct wl1271 *wl)
 
 out:
 	kfree(block);
+	wlcore_set_partition(wl, &old_part);
 }
 
 static void wlcore_print_recovery(struct wl1271 *wl)
@@ -1182,7 +1202,6 @@ int wl1271_plt_stop(struct wl1271 *wl)
 	cancel_work_sync(&wl->recovery_work);
 	cancel_delayed_work_sync(&wl->elp_work);
 	cancel_delayed_work_sync(&wl->tx_watchdog_work);
-	cancel_delayed_work_sync(&wl->connection_loss_work);
 
 	mutex_lock(&wl->mutex);
 	wl1271_power_off(wl);
@@ -1238,6 +1257,8 @@ static void wl1271_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 	skb_queue_tail(&wl->links[hlid].tx_queue[q], skb);
 
 	wl->tx_queue_count[q]++;
+	if (wlvif)
+		wlvif->tx_queue_count[q]++;
 
 	/*
 	 * The workqueue is slow to process the tx_queue and we need stop
@@ -1892,11 +1913,10 @@ static void wlcore_op_stop_locked(struct wl1271 *wl)
 	cancel_work_sync(&wl->tx_work);
 	cancel_delayed_work_sync(&wl->elp_work);
 	cancel_delayed_work_sync(&wl->tx_watchdog_work);
-	cancel_delayed_work_sync(&wl->connection_loss_work);
 
 	/* let's notify MAC80211 about the remaining pending TX frames */
-	wl12xx_tx_reset(wl);
 	mutex_lock(&wl->mutex);
+	wl12xx_tx_reset(wl);
 
 	wl1271_power_off(wl);
 	/*
@@ -1923,9 +1943,12 @@ static void wlcore_op_stop_locked(struct wl1271 *wl)
 	memset(wl->roles_map, 0, sizeof(wl->roles_map));
 	memset(wl->links_map, 0, sizeof(wl->links_map));
 	memset(wl->roc_map, 0, sizeof(wl->roc_map));
+	memset(wl->session_ids, 0, sizeof(wl->session_ids));
 	wl->active_sta_count = 0;
 
 	/* The system link is always allocated */
+	wl->links[WL12XX_SYSTEM_HLID].allocated_pkts = 0;
+	wl->links[WL12XX_SYSTEM_HLID].prev_freed_pkts = 0;
 	__set_bit(WL12XX_SYSTEM_HLID, wl->links_map);
 
 	/*
@@ -1963,6 +1986,71 @@ static void wlcore_op_stop(struct ieee80211_hw *hw)
 
 	wlcore_op_stop_locked(wl);
 
+	mutex_unlock(&wl->mutex);
+}
+
+static void wlcore_channel_switch_work(struct work_struct *work)
+{
+	struct delayed_work *dwork;
+	struct wl1271 *wl;
+	struct ieee80211_vif *vif;
+	struct wl12xx_vif *wlvif;
+	int ret;
+
+	dwork = container_of(work, struct delayed_work, work);
+	wlvif = container_of(dwork, struct wl12xx_vif, channel_switch_work);
+	wl = wlvif->wl;
+
+	wl1271_info("channel switch failed (role_id: %d).", wlvif->role_id);
+
+	mutex_lock(&wl->mutex);
+
+	if (unlikely(wl->state != WLCORE_STATE_ON))
+		goto out;
+
+	/* check the channel switch is still ongoing */
+	if (!test_and_clear_bit(WLVIF_FLAG_CS_PROGRESS, &wlvif->flags))
+		goto out;
+
+	vif = wl12xx_wlvif_to_vif(wlvif);
+	ieee80211_chswitch_done(vif, false);
+
+	ret = wl1271_ps_elp_wakeup(wl);
+	if (ret < 0)
+		goto out;
+
+	wl12xx_cmd_stop_channel_switch(wl, wlvif);
+
+	wl1271_ps_elp_sleep(wl);
+out:
+	mutex_unlock(&wl->mutex);
+}
+
+static void wl1271_connection_loss_work(struct work_struct *work)
+{
+	struct delayed_work *dwork;
+	struct wl1271 *wl;
+	struct ieee80211_vif *vif;
+	struct wl12xx_vif *wlvif;
+
+	dwork = container_of(work, struct delayed_work, work);
+	wlvif = container_of(dwork, struct wl12xx_vif, connection_loss_work);
+	wl = wlvif->wl;
+
+	wl1271_info("Connection loss work (role_id: %d).", wlvif->role_id);
+
+	mutex_lock(&wl->mutex);
+
+	if (unlikely(wl->state != WLCORE_STATE_ON))
+		goto out;
+
+	/* Call mac80211 connection loss */
+	if (!test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags))
+		goto out;
+
+	vif = wl12xx_wlvif_to_vif(wlvif);
+	ieee80211_connection_loss(vif);
+out:
 	mutex_unlock(&wl->mutex);
 }
 
@@ -2113,6 +2201,10 @@ static int wl12xx_init_vif_data(struct wl1271 *wl, struct ieee80211_vif *vif)
 		  wl1271_rx_streaming_enable_work);
 	INIT_WORK(&wlvif->rx_streaming_disable_work,
 		  wl1271_rx_streaming_disable_work);
+	INIT_DELAYED_WORK(&wlvif->channel_switch_work,
+			  wlcore_channel_switch_work);
+	INIT_DELAYED_WORK(&wlvif->connection_loss_work,
+			  wl1271_connection_loss_work);
 	INIT_LIST_HEAD(&wlvif->list);
 
 	setup_timer(&wlvif->rx_streaming_timer, wl1271_rx_streaming_timer,
@@ -2491,6 +2583,7 @@ unlock:
 	del_timer_sync(&wlvif->rx_streaming_timer);
 	cancel_work_sync(&wlvif->rx_streaming_enable_work);
 	cancel_work_sync(&wlvif->rx_streaming_disable_work);
+	cancel_delayed_work_sync(&wlvif->connection_loss_work);
 
 	mutex_lock(&wl->mutex);
 }
@@ -2633,8 +2726,9 @@ static void wl1271_unjoin(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 	if (test_and_clear_bit(WLVIF_FLAG_CS_PROGRESS, &wlvif->flags)) {
 		struct ieee80211_vif *vif = wl12xx_wlvif_to_vif(wlvif);
 
-		wl12xx_cmd_stop_channel_switch(wl);
+		wl12xx_cmd_stop_channel_switch(wl, wlvif);
 		ieee80211_chswitch_done(vif, false);
+		cancel_delayed_work(&wlvif->channel_switch_work);
 	}
 
 	/* invalidate keep-alive template */
@@ -4261,10 +4355,9 @@ sta_not_found:
 		/* TODO: this if/else seems pretty crappy */
 		if ((changed & BSS_CHANGED_HT) &&
 		    (bss_conf->channel_type != NL80211_CHAN_NO_HT)) {
-			ret = wl1271_acx_set_ht_capabilities(wl,
-							     &sta_ht_cap,
-							     true,
-							     wlvif->sta.hlid);
+			ret = wlcore_hw_set_peer_cap(wl, &sta_ht_cap,
+						     true, wlvif->rate_set,
+						     wlvif->sta.hlid);
 			if (ret < 0) {
 				wl1271_warning("Set ht cap true failed %d",
 					       ret);
@@ -4273,10 +4366,9 @@ sta_not_found:
 		}
 		/* handle new association without HT and disassociation */
 		else if (changed & BSS_CHANGED_ASSOC) {
-			ret = wl1271_acx_set_ht_capabilities(wl,
-							     &sta_ht_cap,
-							     false,
-							     wlvif->sta.hlid);
+			ret = wlcore_hw_set_peer_cap(wl, &sta_ht_cap,
+						     false, wlvif->rate_set,
+						     wlvif->sta.hlid);
 			if (ret < 0) {
 				wl1271_warning("Set ht cap false failed %d",
 					       ret);
@@ -4356,7 +4448,7 @@ static void wl1271_op_bss_info_changed(struct ieee80211_hw *hw,
 	 * state changed
 	 */
 	if (!is_ap && (changed & BSS_CHANGED_ASSOC))
-		cancel_delayed_work_sync(&wl->connection_loss_work);
+		cancel_delayed_work_sync(&wlvif->connection_loss_work);
 
 	if (is_ap && (changed & BSS_CHANGED_BEACON_ENABLED) &&
 	    !bss_conf->enable_beacon)
@@ -4531,8 +4623,6 @@ void wl1271_free_sta(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 hlid)
 		return;
 
 	clear_bit(hlid, wlvif->ap.sta_hlid_map);
-	memset(wl->links[hlid].addr, 0, ETH_ALEN);
-	wl->links[hlid].ba_bitmap = 0;
 	__clear_bit(hlid, &wl->ap_ps_map);
 	__clear_bit(hlid, (unsigned long *)&wl->ap_fw_ps_map);
 	wl12xx_free_link(wl, wlvif, &hlid);
@@ -4883,15 +4973,26 @@ static void wl12xx_op_channel_switch(struct ieee80211_hw *hw,
 
 	/* TODO: change mac80211 to pass vif as param */
 	wl12xx_for_each_wlvif_sta(wl, wlvif) {
+		unsigned long delay_usec;
+
 		if (wl12xx_wlvif_to_vif(wlvif)->dummy_p2p)
 			continue;
 
 		ret = wl12xx_cmd_channel_switch(wl, wlvif, ch_switch);
+		if (ret)
+			goto out_sleep;
 
-		if (!ret)
-			set_bit(WLVIF_FLAG_CS_PROGRESS, &wlvif->flags);
+		set_bit(WLVIF_FLAG_CS_PROGRESS, &wlvif->flags);
+
+		/* indicate failure 5 seconds after channel switch time */
+		delay_usec = ieee80211_tu_to_usec(wlvif->beacon_int) *
+			     ch_switch->count;
+		ieee80211_queue_delayed_work(hw, &wlvif->channel_switch_work,
+				usecs_to_jiffies(delay_usec) +
+				msecs_to_jiffies(5000));
 	}
 
+out_sleep:
 	wl1271_ps_elp_sleep(wl);
 
 out:
@@ -5246,20 +5347,20 @@ static struct ieee80211_rate wl1271_rates[] = {
 
 /* can't be const, mac80211 writes to this */
 static struct ieee80211_channel wl1271_channels[] = {
-	{ .hw_value = 1, .center_freq = 2412, .max_power = 25 },
-	{ .hw_value = 2, .center_freq = 2417, .max_power = 25 },
-	{ .hw_value = 3, .center_freq = 2422, .max_power = 25 },
-	{ .hw_value = 4, .center_freq = 2427, .max_power = 25 },
-	{ .hw_value = 5, .center_freq = 2432, .max_power = 25 },
-	{ .hw_value = 6, .center_freq = 2437, .max_power = 25 },
-	{ .hw_value = 7, .center_freq = 2442, .max_power = 25 },
-	{ .hw_value = 8, .center_freq = 2447, .max_power = 25 },
-	{ .hw_value = 9, .center_freq = 2452, .max_power = 25 },
-	{ .hw_value = 10, .center_freq = 2457, .max_power = 25 },
-	{ .hw_value = 11, .center_freq = 2462, .max_power = 25 },
-	{ .hw_value = 12, .center_freq = 2467, .max_power = 25 },
-	{ .hw_value = 13, .center_freq = 2472, .max_power = 25 },
-	{ .hw_value = 14, .center_freq = 2484, .max_power = 25 },
+	{ .hw_value = 1, .center_freq = 2412, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 2, .center_freq = 2417, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 3, .center_freq = 2422, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 4, .center_freq = 2427, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 5, .center_freq = 2432, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 6, .center_freq = 2437, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 7, .center_freq = 2442, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 8, .center_freq = 2447, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 9, .center_freq = 2452, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 10, .center_freq = 2457, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 11, .center_freq = 2462, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 12, .center_freq = 2467, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 13, .center_freq = 2472, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 14, .center_freq = 2484, .max_power = WLCORE_MAX_TX_POWER },
 };
 
 /* can't be const, mac80211 writes to this */
@@ -5300,40 +5401,40 @@ static struct ieee80211_rate wl1271_rates_5ghz[] = {
 
 /* 5 GHz band channels for WL1273 */
 static struct ieee80211_channel wl1271_channels_5ghz[] = {
-	{ .hw_value = 7, .center_freq = 5035, .max_power = 25 },
-	{ .hw_value = 8, .center_freq = 5040, .max_power = 25 },
-	{ .hw_value = 9, .center_freq = 5045, .max_power = 25 },
-	{ .hw_value = 11, .center_freq = 5055, .max_power = 25 },
-	{ .hw_value = 12, .center_freq = 5060, .max_power = 25 },
-	{ .hw_value = 16, .center_freq = 5080, .max_power = 25 },
-	{ .hw_value = 34, .center_freq = 5170, .max_power = 25 },
-	{ .hw_value = 36, .center_freq = 5180, .max_power = 25 },
-	{ .hw_value = 38, .center_freq = 5190, .max_power = 25 },
-	{ .hw_value = 40, .center_freq = 5200, .max_power = 25 },
-	{ .hw_value = 42, .center_freq = 5210, .max_power = 25 },
-	{ .hw_value = 44, .center_freq = 5220, .max_power = 25 },
-	{ .hw_value = 46, .center_freq = 5230, .max_power = 25 },
-	{ .hw_value = 48, .center_freq = 5240, .max_power = 25 },
-	{ .hw_value = 52, .center_freq = 5260, .max_power = 25 },
-	{ .hw_value = 56, .center_freq = 5280, .max_power = 25 },
-	{ .hw_value = 60, .center_freq = 5300, .max_power = 25 },
-	{ .hw_value = 64, .center_freq = 5320, .max_power = 25 },
-	{ .hw_value = 100, .center_freq = 5500, .max_power = 25 },
-	{ .hw_value = 104, .center_freq = 5520, .max_power = 25 },
-	{ .hw_value = 108, .center_freq = 5540, .max_power = 25 },
-	{ .hw_value = 112, .center_freq = 5560, .max_power = 25 },
-	{ .hw_value = 116, .center_freq = 5580, .max_power = 25 },
-	{ .hw_value = 120, .center_freq = 5600, .max_power = 25 },
-	{ .hw_value = 124, .center_freq = 5620, .max_power = 25 },
-	{ .hw_value = 128, .center_freq = 5640, .max_power = 25 },
-	{ .hw_value = 132, .center_freq = 5660, .max_power = 25 },
-	{ .hw_value = 136, .center_freq = 5680, .max_power = 25 },
-	{ .hw_value = 140, .center_freq = 5700, .max_power = 25 },
-	{ .hw_value = 149, .center_freq = 5745, .max_power = 25 },
-	{ .hw_value = 153, .center_freq = 5765, .max_power = 25 },
-	{ .hw_value = 157, .center_freq = 5785, .max_power = 25 },
-	{ .hw_value = 161, .center_freq = 5805, .max_power = 25 },
-	{ .hw_value = 165, .center_freq = 5825, .max_power = 25 },
+	{ .hw_value = 7, .center_freq = 5035, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 8, .center_freq = 5040, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 9, .center_freq = 5045, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 11, .center_freq = 5055, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 12, .center_freq = 5060, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 16, .center_freq = 5080, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 34, .center_freq = 5170, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 36, .center_freq = 5180, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 38, .center_freq = 5190, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 40, .center_freq = 5200, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 42, .center_freq = 5210, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 44, .center_freq = 5220, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 46, .center_freq = 5230, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 48, .center_freq = 5240, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 52, .center_freq = 5260, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 56, .center_freq = 5280, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 60, .center_freq = 5300, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 64, .center_freq = 5320, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 100, .center_freq = 5500, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 104, .center_freq = 5520, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 108, .center_freq = 5540, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 112, .center_freq = 5560, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 116, .center_freq = 5580, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 120, .center_freq = 5600, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 124, .center_freq = 5620, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 128, .center_freq = 5640, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 132, .center_freq = 5660, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 136, .center_freq = 5680, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 140, .center_freq = 5700, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 149, .center_freq = 5745, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 153, .center_freq = 5765, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 157, .center_freq = 5785, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 161, .center_freq = 5805, .max_power = WLCORE_MAX_TX_POWER },
+	{ .hw_value = 165, .center_freq = 5825, .max_power = WLCORE_MAX_TX_POWER },
 };
 
 static struct ieee80211_supported_band wl1271_band_5ghz = {
@@ -5549,34 +5650,6 @@ static struct bin_attribute fwlog_attr = {
 	.read = wl1271_sysfs_read_fwlog,
 };
 
-static void wl1271_connection_loss_work(struct work_struct *work)
-{
-	struct delayed_work *dwork;
-	struct wl1271 *wl;
-	struct ieee80211_vif *vif;
-	struct wl12xx_vif *wlvif;
-
-	dwork = container_of(work, struct delayed_work, work);
-	wl = container_of(dwork, struct wl1271, connection_loss_work);
-
-	wl1271_info("Connection loss work.");
-
-	mutex_lock(&wl->mutex);
-
-	if (unlikely(wl->state != WLCORE_STATE_ON))
-		goto out;
-
-	/* Call mac80211 connection loss */
-	wl12xx_for_each_wlvif_sta(wl, wlvif) {
-		if (!test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags))
-			goto out;
-		vif = wl12xx_wlvif_to_vif(wlvif);
-		ieee80211_connection_loss(vif);
-	}
-out:
-	mutex_unlock(&wl->mutex);
-}
-
 static void wl12xx_derive_mac_addresses(struct wl1271 *wl, u32 oui, u32 nic)
 {
 	int i;
@@ -5725,6 +5798,7 @@ wlcore_iface_combinations[] = {
 
 static int wl1271_init_ieee80211(struct wl1271 *wl)
 {
+	int i;
 	static const u32 cipher_suites[] = {
 		WLAN_CIPHER_SUITE_WEP40,
 		WLAN_CIPHER_SUITE_WEP104,
@@ -5787,6 +5861,21 @@ static int wl1271_init_ieee80211(struct wl1271 *wl)
 	BUILD_BUG_ON(ARRAY_SIZE(wl1271_channels) +
 		     ARRAY_SIZE(wl1271_channels_5ghz) >
 		     WL1271_MAX_CHANNELS);
+	/*
+         * clear channel flags from the previous usage
+         * and restore max_power & max_antenna_gain values.
+         */
+        for (i = 0; i < ARRAY_SIZE(wl1271_channels); i++) {
+                wl1271_band_2ghz.channels[i].flags = 0;
+                wl1271_band_2ghz.channels[i].max_power = WLCORE_MAX_TX_POWER;
+                wl1271_band_2ghz.channels[i].max_antenna_gain = 0;
+        }
+        for (i = 0; i < ARRAY_SIZE(wl1271_channels_5ghz); i++) {
+                wl1271_band_5ghz.channels[i].flags = 0;
+                wl1271_band_5ghz.channels[i].max_power = WLCORE_MAX_TX_POWER;
+                wl1271_band_5ghz.channels[i].max_antenna_gain = 0;
+        }
+
 	/*
 	 * We keep local copies of the band structs because we need to
 	 * modify them on a per-device basis.
@@ -5881,8 +5970,6 @@ struct ieee80211_hw *wlcore_alloc_hw(size_t priv_size, u32 aggr_buf_size,
 	INIT_DELAYED_WORK(&wl->scan_complete_work, wl1271_scan_complete_work);
 	INIT_DELAYED_WORK(&wl->roc_complete_work, wl1271_roc_complete_work);
 	INIT_DELAYED_WORK(&wl->tx_watchdog_work, wl12xx_tx_watchdog_work);
-	INIT_DELAYED_WORK(&wl->connection_loss_work,
-			  wl1271_connection_loss_work);
 
 	wl->freezable_wq = create_freezable_workqueue("wl12xx_wq");
 	if (!wl->freezable_wq) {
@@ -6208,6 +6295,9 @@ MODULE_PARM_DESC(debug_level, "wl12xx debugging level");
 module_param_named(fwlog, fwlog_param, charp, 0);
 MODULE_PARM_DESC(fwlog,
 		 "FW logger options: continuous, ondemand, dbgpins or disable");
+
+module_param(fwlog_mem_blocks, int, S_IRUSR | S_IWUSR);
+MODULE_PARM_DESC(fwlog_mem_blocks, "fwlog mem_blocks");
 
 module_param(bug_on_recovery, int, S_IRUSR | S_IWUSR);
 MODULE_PARM_DESC(bug_on_recovery, "BUG() on fw recovery");
