@@ -1,9 +1,9 @@
 #! /system/bin/sh
 
-WIFION=`getprop init.svc.wpa_supplicant`
+DRIVER_STATE=`getprop wlan.driver.status`
 
-case "$WIFION" in
-  "running") echo " ********************************************************"
+case "$DRIVER_STATE" in
+  "ok") echo " ********************************************************"
              echo " * Turn Wi-Fi OFF and launch the script for calibration *"
              echo " ********************************************************"
              exit;;
