@@ -2,8 +2,8 @@ obj-m += compat.o
 #compat-objs :=
 
 obj-$(CONFIG_COMPAT_FIRMWARE_CLASS) += compat_firmware_class.o
-obj-$(CONFIG_COMPAT_NET_SCH_CODEL) += sch_codel.o
-obj-$(CONFIG_COMPAT_NET_SCH_FQ_CODEL) += sch_fq_codel.o
+#obj-$(CONFIG_COMPAT_NET_SCH_CODEL) += sch_codel.o
+#obj-$(CONFIG_COMPAT_NET_SCH_FQ_CODEL) += sch_fq_codel.o
 
 compat-y += main.o
 

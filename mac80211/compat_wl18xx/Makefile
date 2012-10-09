@@ -53,8 +53,8 @@ endif
 
 endif
 
-obj-$(CONFIG_COMPAT_BLUETOOTH) += net/bluetooth/
-obj-$(CONFIG_COMPAT_BLUETOOTH_MODULES) += drivers/bluetooth/
+#obj-$(CONFIG_COMPAT_BLUETOOTH) += net/bluetooth/
+#obj-$(CONFIG_COMPAT_BLUETOOTH_MODULES) += drivers/bluetooth/
 
 else
 
