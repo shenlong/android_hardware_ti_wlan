@@ -310,6 +310,7 @@ enum plt_mode {
 	PLT_OFF = 0,
 	PLT_ON = 1,
 	PLT_FEM_DETECT = 2,
+	PLT_CHIP_AWAKE = 3
 };
 
 struct wl12xx_rx_filter_field {
@@ -344,7 +345,6 @@ struct wl12xx_vif {
 	union {
 		struct {
 			u8 hlid;
-			u8 ba_rx_bitmap;
 
 			u8 basic_rate_idx;
 			u8 ap_rate_idx;
@@ -441,6 +441,15 @@ struct wl12xx_vif {
 	struct delayed_work connection_loss_work;
 
 	bool pending_roc;
+
+	/*
+	 * This vif's queues are mapped to mac80211 HW queues as:
+	 * VO - hw_queue_base
+	 * VI - hw_queue_base + 1
+	 * BE - hw_queue_base + 2
+	 * BK - hw_queue_base + 3
+	 */
+	int hw_queue_base;
 
 	/*
 	 * This struct must be last!

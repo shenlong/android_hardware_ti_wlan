@@ -326,6 +326,8 @@ int wl12xx_allocate_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid)
 			wl->fw_status_2->counters.tx_lnk_free_pkts[link];
 	wl->links[link].wlvif = wlvif;
 	*hlid = link;
+
+	wl->active_link_count++;
 	return 0;
 }
 
@@ -355,6 +357,8 @@ void wl12xx_free_link(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 *hlid)
 	wl->links[*hlid].wlvif = NULL;
 
 	*hlid = WL12XX_INVALID_LINK_ID;
+	wl->active_link_count--;
+	WARN_ON(wl->active_link_count < 0);
 }
 
 static u8 wlcore_get_native_channel_type(u8 nl_channel_type)
@@ -1563,6 +1567,131 @@ out:
 	return ret;
 }
 
+static int wlcore_get_reg_conf_ch_idx(enum ieee80211_band band, u16 ch)
+{
+	int idx = -1;
+
+	switch (band) {
+	case IEEE80211_BAND_5GHZ:
+		if (ch >= 8 && ch <= 16)
+			idx = ((ch-8)/4 + 18);
+		else if (ch >= 34 && ch <= 64)
+			idx = ((ch-34)/2 + 3 + 18);
+		else if (ch >= 100 && ch <= 140)
+			idx = ((ch-100)/4 + 15 + 18);
+		else if (ch >= 149 && ch <= 165)
+			idx = ((ch-149)/4 + 26 + 18);
+		else
+			idx = -1;
+		break;
+	case IEEE80211_BAND_2GHZ:
+		if (ch >= 1 && ch <= 14)
+			idx = ch - 1;
+		else
+			idx = -1;
+		break;
+	default:
+		wl1271_error("get reg conf ch idx - unknown band: %d",
+			     (int)band);
+	}
+
+	return idx;
+}
+
+void wlcore_set_pending_regdomain_ch(struct wl1271 *wl, u16 channel,
+				     enum ieee80211_band band)
+{
+	int ch_bit_idx = 0;
+
+	if (!(wl->quirks & WLCORE_QUIRK_REGDOMAIN_CONF))
+		return;
+
+	ch_bit_idx = wlcore_get_reg_conf_ch_idx(band, channel);
+
+	if (ch_bit_idx > 0 && ch_bit_idx <= WL1271_MAX_CHANNELS)
+		set_bit(ch_bit_idx, (long *)wl->reg_ch_conf_pending);
+}
+
+int wlcore_cmd_regdomain_config_locked(struct wl1271 *wl)
+{
+	struct wl12xx_cmd_regdomain_dfs_config *cmd = NULL;
+	int ret = 0, i, b, ch_bit_idx;
+	struct ieee80211_channel *channel;
+	u32 tmp_ch_bitmap[2];
+	u16 ch;
+	struct wiphy *wiphy = wl->hw->wiphy;
+	struct ieee80211_supported_band *band;
+	bool timeout = false;
+
+	if (!(wl->quirks & WLCORE_QUIRK_REGDOMAIN_CONF))
+		return 0;
+
+	wl1271_debug(DEBUG_CMD, "cmd reg domain config");
+
+	memset(tmp_ch_bitmap, 0, sizeof(tmp_ch_bitmap));
+
+	for (b = IEEE80211_BAND_2GHZ; b <= IEEE80211_BAND_5GHZ; b++) {
+		band = wiphy->bands[b];
+		for (i = 0; i < band->n_channels; i++) {
+			channel = &band->channels[i];
+			ch = channel->hw_value;
+
+			if (channel->flags & (IEEE80211_CHAN_DISABLED |
+					      IEEE80211_CHAN_RADAR |
+					      IEEE80211_CHAN_PASSIVE_SCAN))
+				continue;
+
+			ch_bit_idx = wlcore_get_reg_conf_ch_idx(b, ch);
+			if (ch_bit_idx < 0)
+				continue;
+
+			set_bit(ch_bit_idx, (long *)tmp_ch_bitmap);
+		}
+	}
+
+	tmp_ch_bitmap[0] |= wl->reg_ch_conf_pending[0];
+	tmp_ch_bitmap[1] |= wl->reg_ch_conf_pending[1];
+
+	if (!memcmp(tmp_ch_bitmap, wl->reg_ch_conf_last, sizeof(tmp_ch_bitmap)))
+		goto out;
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	cmd->ch_bit_map1 = cpu_to_le32(tmp_ch_bitmap[0]);
+	cmd->ch_bit_map2 = cpu_to_le32(tmp_ch_bitmap[1]);
+
+	wl1271_debug(DEBUG_CMD,
+		     "cmd reg domain bitmap1: 0x%08x, bitmap2: 0x%08x",
+		     cmd->ch_bit_map1, cmd->ch_bit_map2);
+
+	ret = wl1271_cmd_send(wl, CMD_DFS_CHANNEL_CONFIG, cmd, sizeof(*cmd), 0);
+	if (ret < 0) {
+		wl1271_error("failed to send reg domain dfs config");
+		goto out;
+	}
+
+	ret = wl1271_cmd_wait_for_event_or_timeout(wl,
+					   DFS_CHANNELS_CONFIG_COMPLETE_EVENT,
+					   &timeout);
+	if (ret < 0 || timeout) {
+		wl1271_error("reg domain conf %serror",
+			     timeout ? "completion " : "");
+		ret = timeout ? -ETIMEDOUT : ret;
+		goto out;
+	}
+
+	memcpy(wl->reg_ch_conf_last, tmp_ch_bitmap, sizeof(tmp_ch_bitmap));
+	memset(wl->reg_ch_conf_pending, 0, sizeof(wl->reg_ch_conf_pending));
+
+out:
+	kfree(cmd);
+	return ret;
+}
+
 int wl12xx_cmd_config_fwlog(struct wl1271 *wl)
 {
 	struct wl12xx_cmd_config_fwlog *cmd;
@@ -1648,12 +1777,13 @@ out:
 }
 
 static int wl12xx_cmd_roc(struct wl1271 *wl, struct wl12xx_vif *wlvif,
-			  u8 role_id, u8 channel)
+			  u8 role_id, enum ieee80211_band band, u8 channel)
 {
 	struct wl12xx_cmd_roc *cmd;
 	int ret = 0;
 
-	wl1271_debug(DEBUG_CMD, "cmd roc %d (%d)", channel, role_id);
+	wl1271_debug(DEBUG_CMD, "cmd roc band %d chan %d role %d", band,
+		     channel, role_id);
 
 	if (WARN_ON(role_id == WL12XX_INVALID_ROLE_ID))
 		return -EINVAL;
@@ -1666,7 +1796,7 @@ static int wl12xx_cmd_roc(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 
 	cmd->role_id = role_id;
 	cmd->channel = channel;
-	switch (wlvif->band) {
+	switch (band) {
 	case IEEE80211_BAND_2GHZ:
 		cmd->band = WLCORE_BAND_2_4GHZ;
 		break;
@@ -1674,7 +1804,7 @@ static int wl12xx_cmd_roc(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 		cmd->band = WLCORE_BAND_5GHZ;
 		break;
 	default:
-		wl1271_error("roc - unknown band: %d", (int)wlvif->band);
+		wl1271_error("roc - unknown band: %d", band);
 		ret = -EINVAL;
 		goto out_free;
 	}
@@ -1722,14 +1852,14 @@ out:
 }
 
 int wl12xx_roc(struct wl1271 *wl, struct wl12xx_vif *wlvif, u8 role_id,
-	       u8 channel)
+	       enum ieee80211_band band, u8 channel)
 {
 	int ret = 0;
 
 	if (WARN_ON(test_bit(role_id, wl->roc_map)))
 		return 0;
 
-	ret = wl12xx_cmd_roc(wl, wlvif, role_id, channel);
+	ret = wl12xx_cmd_roc(wl, wlvif, role_id, band, channel);
 	if (ret < 0)
 		goto out;
 /*
@@ -1864,7 +1994,7 @@ int wl12xx_start_dev(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 	if (ret < 0)
 		goto out_disable;
 
-	ret = wl12xx_roc(wl, wlvif, wlvif->dev_role_id, channel);
+	ret = wl12xx_roc(wl, wlvif, wlvif->dev_role_id, band, channel);
 	if (ret < 0)
 		goto out_stop;
 

@@ -82,6 +82,8 @@ void wl1271_scan_complete_work(struct work_struct *work)
 		wl12xx_queue_recovery_work(wl);
 	}
 
+	wlcore_cmd_regdomain_config_locked(wl);
+
 	ieee80211_scan_completed(wl->hw, false);
 
 out:
@@ -107,9 +109,15 @@ wlcore_scan_get_channels(struct wl1271 *wl,
 
 	if (scan_type == SCAN_TYPE_SEARCH) {
 		struct conf_scan_settings *c = &wl->conf.scan;
+		bool active_vif_exists = !!ieee80211_started_vifs_count(wl->hw);
 
-		min_dwell_time_active = c->min_dwell_time_active;
-		max_dwell_time_active = c->max_dwell_time_active;
+		min_dwell_time_active = active_vif_exists ?
+			c->min_dwell_time_active_conc :
+			c->min_dwell_time_active;
+		max_dwell_time_active = active_vif_exists ?
+			c->max_dwell_time_active_conc :
+			c->max_dwell_time_active;
+
 		/* TODO: convert conf from min/max to a single value */
 		dwell_time_passive = c->dwell_time_passive;
 		dwell_time_dfs = c->dwell_time_dfs;
@@ -355,27 +363,27 @@ static int wl1271_scan_send(struct wl1271 *wl, struct ieee80211_vif *vif,
 	if (cmd->active[0]) {
 		u8 band = IEEE80211_BAND_2GHZ;
 		ret = wl12xx_cmd_build_probe_req(wl, wlvif,
-						 cmd->role_id, band,
-						 req->ssids[0].ssid,
-						 req->ssids[0].ssid_len,
-						 req->ie,
-						 req->ie_len,
-						 false);
+				cmd->role_id, band,
+				req->ssids ? req->ssids[0].ssid : NULL,
+				req->ssids ? req->ssids[0].ssid_len : 0,
+				req->ie,
+				req->ie_len,
+				false);
 		if (ret < 0) {
 			wl1271_error("2.4GHz PROBE request template failed");
 			goto out;
 		}
 	}
 
-	if (cmd->active[1]) {
+	if (cmd->active[1] || cmd->dfs) {
 		u8 band = IEEE80211_BAND_5GHZ;
 		ret = wl12xx_cmd_build_probe_req(wl, wlvif,
-						 cmd->role_id, band,
-						 req->ssids[0].ssid,
-						 req->ssids[0].ssid_len,
-						 req->ie,
-						 req->ie_len,
-						 false);
+				cmd->role_id, band,
+				req->ssids ? req->ssids[0].ssid : NULL,
+				req->ssids ? req->ssids[0].ssid_len : 0,
+				req->ie,
+				req->ie_len,
+				false);
 		if (ret < 0) {
 			wl1271_error("5GHz PROBE request template failed");
 			goto out;
@@ -644,30 +652,34 @@ int wl1271_scan_sched_scan_config(struct wl1271 *wl,
 
 	cmd->tag = WL1271_SCAN_DEFAULT_TAG;
 
+	/* create a PERIODIC_SCAN_REPORT_EVENT whenever we've got a match */
+	cmd->report_threshold = 1;
+	cmd->terminate_on_report = 0;
+
 	if (cmd->active[0]) {
 		u8 band = IEEE80211_BAND_2GHZ;
 		ret = wl12xx_cmd_build_probe_req(wl, wlvif,
-						 cmd->role_id, band,
-						 req->ssids[0].ssid,
-						 req->ssids[0].ssid_len,
-						 ies->ie[band],
-						 ies->len[band],
-						 true);
+				cmd->role_id, band,
+				req->ssids ? req->ssids[0].ssid : NULL,
+				req->ssids ? req->ssids[0].ssid_len : 0,
+				ies->ie[band],
+				ies->len[band],
+				true);
 		if (ret < 0) {
 			wl1271_error("2.4GHz PROBE request template failed");
 			goto out;
 		}
 	}
 
-	if (cmd->active[1]) {
+	if (cmd->active[1] || cmd->dfs) {
 		u8 band = IEEE80211_BAND_5GHZ;
 		ret = wl12xx_cmd_build_probe_req(wl, wlvif,
-						 cmd->role_id, band,
-						 req->ssids[0].ssid,
-						 req->ssids[0].ssid_len,
-						 ies->ie[band],
-						 ies->len[band],
-						 true);
+				cmd->role_id, band,
+				req->ssids ? req->ssids[0].ssid : NULL,
+				req->ssids ? req->ssids[0].ssid_len : 0,
+				ies->ie[band],
+				ies->len[band],
+				true);
 		if (ret < 0) {
 			wl1271_error("5GHz PROBE request template failed");
 			goto out;

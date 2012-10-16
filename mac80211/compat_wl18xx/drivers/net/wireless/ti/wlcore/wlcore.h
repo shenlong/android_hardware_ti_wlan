@@ -46,6 +46,7 @@ enum wl_rx_buf_align;
 struct wl1271_rx_descriptor;
 
 struct wlcore_ops {
+	int (*setup)(struct wl1271 *wl);
 	int (*identify_chip)(struct wl1271 *wl);
 	int (*identify_fw)(struct wl1271 *wl);
 	int (*boot)(struct wl1271 *wl);
@@ -95,6 +96,10 @@ struct wlcore_ops {
 			    bool allow_ht_operation,
 			    u32 rate_set, u8 hlid);
 	u32 (*convert_hwaddr)(struct wl1271 *wl, u32 hwaddr);
+	bool (*lnk_high_prio)(struct wl1271 *wl, u8 hlid,
+			      struct wl1271_link *lnk);
+	bool (*lnk_low_prio)(struct wl1271 *wl, u8 hlid,
+			      struct wl1271_link *lnk);
 };
 
 enum wlcore_partitions {
@@ -165,6 +170,7 @@ struct wl1271 {
 	bool mac80211_registered;
 
 	struct device *dev;
+	struct platform_device *pdev;
 
 	void *if_priv;
 
@@ -242,7 +248,8 @@ struct wl1271 {
 
 	/* Frames scheduled for transmission, not handled yet */
 	int tx_queue_count[NUM_TX_QUEUES];
-	unsigned long queue_stop_reasons[NUM_TX_QUEUES];
+	unsigned long queue_stop_reasons[
+				NUM_TX_QUEUES * WLCORE_NUM_MAC_ADDRESSES];
 
 	/* Frames received, not handled yet by mac80211 */
 	struct sk_buff_head deferred_rx_queue;
@@ -290,11 +297,18 @@ struct wl1271 {
 	struct work_struct recovery_work;
 	bool watchdog_recovery;
 
+	/* Reg domain last configuration */
+	u32 reg_ch_conf_last[2];
+	/* Reg domain pending configuration */
+	u32 reg_ch_conf_pending[2];
+
 	/* Pointer that holds DMA-friendly block for the mailbox */
 	struct event_mailbox *mbox;
 
 	/* The mbox event mask */
 	u32 event_mask;
+	/* Specific chip family mbox event mask */
+	u32 chip_family_event_mask;
 
 	/* Mailbox pointers */
 	u32 mbox_ptr[2];
@@ -325,7 +339,7 @@ struct wl1271 {
 #endif
 	struct wl1271_stats stats;
 
-	__le32 buffer_32;
+	__le32 *buffer_32;
 	u32 buffer_cmd;
 	u32 buffer_busyword[WL1271_BUSY_WORD_CNT];
 
@@ -360,6 +374,9 @@ struct wl1271 {
 	 * are always active.
 	 */
 	struct wl1271_link links[WL12XX_MAX_LINKS];
+
+	/* number of currently active links */
+	int active_link_count;
 
 	/* Fast/slow links bitmap according to FW */
 	u32 fw_fast_lnk_map;
@@ -455,6 +472,7 @@ int wlcore_set_key(struct wl1271 *wl, enum set_key_cmd cmd,
 		   struct ieee80211_vif *vif,
 		   struct ieee80211_sta *sta,
 		   struct ieee80211_key_conf *key_conf);
+void wlcore_regdomain_config(struct wl1271 *wl);
 
 static inline void
 wlcore_set_ht_cap(struct wl1271 *wl, enum ieee80211_band band,
@@ -506,6 +524,10 @@ wlcore_set_min_fw_ver(struct wl1271 *wl, unsigned int chip,
 
 /* separate probe response templates for one-shot and sched scans */
 #define WLCORE_QUIRK_DUAL_PROBE_TMPL		BIT(10)
+
+/* Firmware requires reg domain configuration for active calibration */
+#define WLCORE_QUIRK_REGDOMAIN_CONF		BIT(11)
+
 
 /* TODO: move to the lower drivers when all usages are abstracted */
 #define CHIP_ID_1271_PG10              (0x4030101)

@@ -267,8 +267,10 @@ static struct wlcore_conf wl12xx_conf = {
 		.avg_weight_snr_data          = 10,
 	},
 	.scan = {
-		.min_dwell_time_active        = 7500,
-		.max_dwell_time_active        = 30000,
+		.min_dwell_time_active_conc   = 7500,
+		.max_dwell_time_active_conc   = 30000,
+		.min_dwell_time_active        = 25000,
+		.max_dwell_time_active        = 50000,
 		.dwell_time_passive           = 100000,
 		.dwell_time_dfs               = 150000,
 		.num_probe_reqs               = 2,
@@ -611,7 +613,7 @@ static int wl127x_prepare_read(struct wl1271 *wl, u32 rx_desc, u32 len)
 
 	if (wl->chip.id != CHIP_ID_1283_PG20) {
 		struct wl1271_acx_mem_map *wl_mem_map = wl->target_mem_map;
-		struct wl127x_rx_mem_pool_addr rx_mem_addr;
+		struct wl12xx_priv *priv = wl->priv;
 
 		/*
 		 * Choose the block we want to read
@@ -620,13 +622,13 @@ static int wl127x_prepare_read(struct wl1271 *wl, u32 rx_desc, u32 len)
 		 */
 		u32 mem_block = rx_desc & RX_MEM_BLOCK_MASK;
 
-		rx_mem_addr.addr = (mem_block << 8) +
+		priv->rx_mem_addr->addr = (mem_block << 8) +
 			le32_to_cpu(wl_mem_map->packet_memory_pool_start);
 
-		rx_mem_addr.addr_extra = rx_mem_addr.addr + 4;
+		priv->rx_mem_addr->addr_extra = priv->rx_mem_addr->addr + 4;
 
-		ret = wlcore_write(wl, WL1271_SLV_REG_DATA, &rx_mem_addr,
-				   sizeof(rx_mem_addr), false);
+		ret = wlcore_write(wl, WL1271_SLV_REG_DATA, priv->rx_mem_addr,
+				   sizeof(*priv->rx_mem_addr), false);
 		if (ret < 0)
 			return ret;
 	}
@@ -1614,7 +1616,30 @@ static u32 wl12xx_convert_hwaddr(struct wl1271 *wl, u32 hwaddr)
 	return hwaddr << 5;
 }
 
+static bool wl12xx_lnk_high_prio(struct wl1271 *wl, u8 hlid,
+				 struct wl1271_link *lnk)
+{
+	u8 thold;
+
+	if (test_bit(hlid, (unsigned long *)&wl->fw_fast_lnk_map))
+		thold = wl->conf.tx.fast_link_thold;
+	else
+		thold = wl->conf.tx.slow_link_thold;
+
+	return lnk->allocated_pkts < thold;
+}
+
+static bool wl12xx_lnk_low_prio(struct wl1271 *wl, u8 hlid,
+				struct wl1271_link *lnk)
+{
+	/* any link is good for low priority */
+	return true;
+}
+
+static int wl12xx_setup(struct wl1271 *wl);
+
 static struct wlcore_ops wl12xx_ops = {
+	.setup			= wl12xx_setup,
 	.identify_chip		= wl12xx_identify_chip,
 	.identify_fw		= wl12xx_identify_fw,
 	.boot			= wl12xx_boot,
@@ -1642,6 +1667,8 @@ static struct wlcore_ops wl12xx_ops = {
 	.pre_pkt_send		= NULL,
 	.set_peer_cap		= wl12xx_set_peer_cap,
 	.convert_hwaddr = wl12xx_convert_hwaddr,
+	.lnk_high_prio		= wl12xx_lnk_high_prio,
+	.lnk_low_prio		= wl12xx_lnk_low_prio,
 };
 
 static struct ieee80211_sta_ht_cap wl12xx_ht_cap = {
@@ -1657,24 +1684,11 @@ static struct ieee80211_sta_ht_cap wl12xx_ht_cap = {
 		},
 };
 
-static int __devinit wl12xx_probe(struct platform_device *pdev)
+static int wl12xx_setup(struct wl1271 *wl)
 {
-	struct wl12xx_platform_data *pdata = pdev->dev.platform_data;
-	struct wl1271 *wl;
-	struct ieee80211_hw *hw;
-	struct wl12xx_priv *priv;
+	struct wl12xx_priv *priv = wl->priv;
+	struct wl12xx_platform_data *pdata = wl->pdev->dev.platform_data;
 
-	hw = wlcore_alloc_hw(sizeof(*priv), WL12XX_AGGR_BUFFER_SIZE,
-				WL12XX_NUM_TX_DESCRIPTORS);
-	if (IS_ERR(hw)) {
-		wl1271_error("can't allocate hw");
-		return PTR_ERR(hw);
-	}
-
-	wl = hw->priv;
-	priv = wl->priv;
-	wl->ops = &wl12xx_ops;
-	wl->ptable = wl12xx_ptable;
 	wl->rtable = wl12xx_rtable;
 	wl->num_tx_desc = WL12XX_NUM_TX_DESCRIPTORS;
 	wl->num_rx_desc = WL12XX_NUM_RX_DESCRIPTORS;
@@ -1729,7 +1743,56 @@ static int __devinit wl12xx_probe(struct platform_device *pdev)
 		else
 			wl1271_error("Invalid tcxo parameter %s", tcxo_param);
 	}
-	return wlcore_probe(wl, pdev);
+
+	priv->rx_mem_addr = kmalloc(sizeof(*priv->rx_mem_addr), GFP_KERNEL);
+	if (!priv->rx_mem_addr)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int __devinit wl12xx_probe(struct platform_device *pdev)
+{
+	struct wl1271 *wl;
+	struct ieee80211_hw *hw;
+	int ret;
+
+	hw = wlcore_alloc_hw(sizeof(struct wl12xx_priv),
+			     WL12XX_AGGR_BUFFER_SIZE, WL12XX_NUM_TX_DESCRIPTORS);
+	if (IS_ERR(hw)) {
+		wl1271_error("can't allocate hw");
+		ret = PTR_ERR(hw);
+		goto out;
+	}
+
+	wl = hw->priv;
+	wl->ops = &wl12xx_ops;
+	wl->ptable = wl12xx_ptable;
+	ret = wlcore_probe(wl, pdev);
+	if (ret)
+		goto out_free;
+
+	return ret;
+
+out_free:
+	wlcore_free_hw(wl);
+out:
+	return ret;
+}
+
+static int __devexit wl12xx_remove(struct platform_device *pdev)
+{
+	struct wl1271 *wl = platform_get_drvdata(pdev);
+	struct wl12xx_priv *priv;
+
+	if (!wl)
+		goto out;
+	priv = wl->priv;
+
+	kfree(priv->rx_mem_addr);
+
+	out:
+		return wlcore_remove(pdev);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)

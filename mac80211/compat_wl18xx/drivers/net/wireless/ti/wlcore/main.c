@@ -95,6 +95,8 @@ static int wl1271_reg_notify(struct wiphy *wiphy,
 	struct ieee80211_supported_band *band;
 	struct ieee80211_channel *ch;
 	int i;
+	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
+	struct wl1271 *wl = hw->priv;
 
 	band = wiphy->bands[IEEE80211_BAND_5GHZ];
 	for (i = 0; i < band->n_channels; i++) {
@@ -107,6 +109,9 @@ static int wl1271_reg_notify(struct wiphy *wiphy,
 				     IEEE80211_CHAN_PASSIVE_SCAN;
 
 	}
+
+	if (likely(wl->state == WLCORE_STATE_ON))
+		wlcore_regdomain_config(wl);
 
 	return 0;
 }
@@ -343,10 +348,10 @@ static void wl12xx_irq_ps_regulate_link(struct wl1271 *wl,
 					struct wl12xx_vif *wlvif,
 					u8 hlid, u8 tx_pkts)
 {
-	bool fw_ps, single_sta;
+	bool fw_ps, single_link;
 
 	fw_ps = test_bit(hlid, (unsigned long *)&wl->ap_fw_ps_map);
-	single_sta = (wl->active_sta_count == 1);
+	single_link = (wl->active_link_count == 1);
 
 	/*
 	 * Wake up from high level PS if the STA is asleep with too little
@@ -357,10 +362,10 @@ static void wl12xx_irq_ps_regulate_link(struct wl1271 *wl,
 
 	/*
 	 * Start high-level PS if the STA is asleep with enough blocks in FW.
-	 * Make an exception if this is the only connected station. In this
-	 * case FW-memory congestion is not a problem.
+	 * Make an exception if this is the only connected link. In this
+	 * case FW-memory congestion is less of a problem.
 	 */
-	else if (!single_sta && fw_ps && tx_pkts >= WL1271_PS_STA_MAX_PACKETS)
+	else if (!single_link && fw_ps && tx_pkts >= WL1271_PS_STA_MAX_PACKETS)
 		wl12xx_ps_link_start(wl, wlvif, hlid, true);
 }
 
@@ -1109,7 +1114,8 @@ int wl1271_plt_start(struct wl1271 *wl, const enum plt_mode plt_mode)
 	static const char* const PLT_MODE[] = {
 		"PLT_OFF",
 		"PLT_ON",
-		"PLT_FEM_DETECT"
+		"PLT_FEM_DETECT",
+		"PLT_CHIP_AWAKE"
 	};
 
 	int ret;
@@ -1135,9 +1141,11 @@ int wl1271_plt_start(struct wl1271 *wl, const enum plt_mode plt_mode)
 		if (ret < 0)
 			goto power_off;
 
-		ret = wl->ops->plt_init(wl);
-		if (ret < 0)
-			goto power_off;
+		if (plt_mode != PLT_CHIP_AWAKE) {
+			ret = wl->ops->plt_init(wl);
+			if (ret < 0)
+				goto power_off;
+		}
 
 		wl->state = WLCORE_STATE_ON;
 		wl1271_notice("firmware booted in PLT mode %s (%s)",
@@ -1248,8 +1256,8 @@ static void wl1271_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 	 */
 	if (hlid == WL12XX_INVALID_LINK_ID ||
 	    (!test_bit(hlid, wlvif->links_map)) ||
-	     (wlcore_is_queue_stopped(wl, q) &&
-	      !wlcore_is_queue_stopped_by_reason(wl, q,
+	     (wlcore_is_queue_stopped_locked(wl, wlvif, q) &&
+	      !wlcore_is_queue_stopped_by_reason_locked(wl, wlvif, q,
 			WLCORE_QUEUE_STOP_REASON_WATERMARK))) {
 		wl1271_debug(DEBUG_TX, "DROP skb hlid %d q %d", hlid, q);
 		ieee80211_free_txskb(hw, skb);
@@ -1267,11 +1275,11 @@ static void wl1271_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 	 * The workqueue is slow to process the tx_queue and we need stop
 	 * the queue here, otherwise the queue will get too long.
 	 */
-	if (wl->tx_queue_count[q] >= WL1271_TX_QUEUE_HIGH_WATERMARK &&
-	    !wlcore_is_queue_stopped_by_reason(wl, q,
+	if (wlvif->tx_queue_count[q] >= WL1271_TX_QUEUE_HIGH_WATERMARK &&
+	    !wlcore_is_queue_stopped_by_reason_locked(wl, wlvif, q,
 					WLCORE_QUEUE_STOP_REASON_WATERMARK)) {
 		wl1271_debug(DEBUG_TX, "op_tx: stopping queues for q %d", q);
-		wlcore_stop_queue_locked(wl, q,
+		wlcore_stop_queue_locked(wl, wlvif, q,
 					 WLCORE_QUEUE_STOP_REASON_WATERMARK);
 	}
 
@@ -1948,6 +1956,7 @@ static void wlcore_op_stop_locked(struct wl1271 *wl)
 	memset(wl->roc_map, 0, sizeof(wl->roc_map));
 	memset(wl->session_ids, 0, sizeof(wl->session_ids));
 	wl->active_sta_count = 0;
+	wl->active_link_count = 0;
 
 	/* The system link is always allocated */
 	wl->links[WL12XX_SYSTEM_HLID].allocated_pkts = 0;
@@ -1977,6 +1986,12 @@ static void wlcore_op_stop_locked(struct wl1271 *wl)
 	wl->tx_res_if = NULL;
 	kfree(wl->target_mem_map);
 	wl->target_mem_map = NULL;
+
+	/*
+	 * FW channels must be re-calibrated after recovery,
+	 * clear the last Reg-Domain channel configuration.
+	 */
+	memset(wl->reg_ch_conf_last, 0, sizeof(wl->reg_ch_conf_last));
 }
 
 static void wlcore_op_stop(struct ieee80211_hw *hw)
@@ -2341,6 +2356,81 @@ static void wl12xx_force_active_psm(struct wl1271 *wl)
 	}
 }
 
+struct wlcore_hw_queue_iter_data {
+	unsigned long hw_queue_map[BITS_TO_LONGS(WLCORE_NUM_MAC_ADDRESSES)];
+	/* current vif */
+	struct ieee80211_vif *vif;
+	/* is the current vif among those iterated */
+	bool cur_running;
+};
+
+static void wlcore_hw_queue_iter(void *data, u8 *mac,
+				 struct ieee80211_vif *vif)
+{
+	struct wlcore_hw_queue_iter_data *iter_data = data;
+
+	if (WARN_ON(vif->hw_queue[0] == IEEE80211_INVAL_HW_QUEUE))
+		return;
+
+	if (iter_data->cur_running || vif == iter_data->vif) {
+		iter_data->cur_running = true;
+		return;
+	}
+
+	__set_bit(vif->hw_queue[0] / NUM_TX_QUEUES, iter_data->hw_queue_map);
+}
+
+static int wlcore_allocate_hw_queue_base(struct wl1271 *wl,
+					 struct wl12xx_vif *wlvif)
+{
+	struct ieee80211_vif *vif = wl12xx_wlvif_to_vif(wlvif);
+	struct wlcore_hw_queue_iter_data iter_data = {};
+	int i, q_base;
+
+	iter_data.vif = vif;
+
+	/* mark all bits taken by active interfaces */
+	ieee80211_iterate_active_interfaces_atomic(wl->hw,
+						   wlcore_hw_queue_iter,
+						   &iter_data);
+
+	/* the current vif is already running in mac80211 (resume/recovery) */
+	if (iter_data.cur_running) {
+		wlvif->hw_queue_base = vif->hw_queue[0];
+		wl1271_debug(DEBUG_MAC80211,
+			     "using pre-allocated hw queue base %d",
+			     wlvif->hw_queue_base);
+
+		/* interface type might have changed type */
+		goto adjust_cab_queue;
+	}
+
+	q_base = find_first_zero_bit(iter_data.hw_queue_map,
+				     WLCORE_NUM_MAC_ADDRESSES);
+	if (q_base >= WLCORE_NUM_MAC_ADDRESSES)
+		return -EBUSY;
+
+	wlvif->hw_queue_base = q_base * NUM_TX_QUEUES;
+	wl1271_debug(DEBUG_MAC80211, "allocating hw queue base: %d",
+		     wlvif->hw_queue_base);
+
+	for (i = 0; i < NUM_TX_QUEUES; i++) {
+		wl->queue_stop_reasons[wlvif->hw_queue_base + i] = 0;
+		/* register hw queues in mac80211 */
+		vif->hw_queue[i] = wlvif->hw_queue_base + i;
+	}
+
+adjust_cab_queue:
+	/* the last places are reserved for cab queues per interface */
+	if (wlvif->bss_type == BSS_TYPE_AP_BSS)
+		vif->cab_queue = NUM_TX_QUEUES * WLCORE_NUM_MAC_ADDRESSES +
+				 wlvif->hw_queue_base / NUM_TX_QUEUES;
+	else
+		vif->cab_queue = IEEE80211_INVAL_HW_QUEUE;
+
+	return 0;
+}
+
 static int wl1271_op_add_interface(struct ieee80211_hw *hw,
 				   struct ieee80211_vif *vif)
 {
@@ -2350,6 +2440,11 @@ static int wl1271_op_add_interface(struct ieee80211_hw *hw,
 	int ret = 0;
 	u8 role_type;
 	bool booted = false;
+
+	if (wl->plt) {
+		wl1271_error("Adding Interface not allowed while in PLT mode");
+		return -EBUSY;
+	}
 
 	vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER |
 			     IEEE80211_VIF_SUPPORTS_CQM_RSSI;
@@ -2386,6 +2481,10 @@ static int wl1271_op_add_interface(struct ieee80211_hw *hw,
 		ret = -EINVAL;
 		goto out;
 	}
+
+	ret = wlcore_allocate_hw_queue_base(wl, wlvif);
+	if (ret < 0)
+		goto out;
 
 #if 0
 	if (wl12xx_need_fw_change(wl, vif_count, true)) {
@@ -2677,7 +2776,7 @@ static int wl1271_join(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 
 	if (wlvif->pending_roc) {
 		/* TODO: check for active scans, etc. */
-		wl12xx_roc(wl, wlvif, wlvif->role_id, wlvif->channel);
+		wl12xx_roc(wl, wlvif, wlvif->role_id, wlvif->band, wlvif->channel);
 		wlvif->pending_roc = false;
 	}
 out:
@@ -2756,51 +2855,26 @@ static void wl1271_set_band_rate(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 	wlvif->basic_rate_set = wlvif->bitrate_masks[wlvif->band];
 	wlvif->rate_set = wlvif->basic_rate_set;
 }
-#if 0
-static int wl1271_sta_handle_idle(struct wl1271 *wl, struct wl12xx_vif *wlvif,
-				  bool idle)
+
+static void wl1271_sta_handle_idle(struct wl1271 *wl, struct wl12xx_vif *wlvif,
+				   bool idle)
 {
-	int ret;
 	bool cur_idle = !test_bit(WLVIF_FLAG_IN_USE, &wlvif->flags);
 
 	if (idle == cur_idle)
-		return 0;
+		return;
 
 	if (idle) {
-		/* no need to croc if we weren't busy (e.g. during boot) */
-		if (wl12xx_dev_role_started(wlvif)) {
-			ret = wl12xx_stop_dev(wl, wlvif);
-			if (ret < 0)
-				goto out;
-		}
-		wlvif->rate_set =
-			wl1271_tx_min_rate_get(wl, wlvif->basic_rate_set);
-		ret = wl1271_acx_sta_rate_policies(wl, wlvif);
-		if (ret < 0)
-			goto out;
-		ret = wl1271_acx_keep_alive_config(
-			wl, wlvif, CMD_TEMPL_KLV_IDX_NULL_DATA,
-			ACX_KEEP_ALIVE_TPL_INVALID);
-		if (ret < 0)
-			goto out;
 		clear_bit(WLVIF_FLAG_IN_USE, &wlvif->flags);
 	} else {
 		/* The current firmware only supports sched_scan in idle */
-		if (wl->sched_scanning) {
+		if (wl->sched_vif == wl12xx_wlvif_to_vif(wlvif))
 			wl1271_scan_sched_scan_stop(wl, wlvif);
-			ieee80211_sched_scan_stopped(wl->hw);
-		}
 
-		ret = wl12xx_start_dev(wl, wlvif);
-		if (ret < 0)
-			goto out;
 		set_bit(WLVIF_FLAG_IN_USE, &wlvif->flags);
 	}
-
-out:
-	return ret;
 }
-#endif
+
 static int wl12xx_config_vif(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 			     struct ieee80211_conf *conf, u32 changed)
 {
@@ -3232,10 +3306,7 @@ static int wlcore_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		 * stop the queues and flush to ensure the next packets are
 		 * in sync with FW spare block accounting
 		 */
-		mutex_lock(&wl->mutex);
 		wlcore_stop_queues(wl, WLCORE_QUEUE_STOP_REASON_SPARE_BLK);
-		mutex_unlock(&wl->mutex);
-
 		wl1271_tx_flush(wl);
 	}
 
@@ -3406,6 +3477,29 @@ out_sleep:
 out_unlock:
 	mutex_unlock(&wl->mutex);
 	return ret;
+}
+
+void wlcore_regdomain_config(struct wl1271 *wl)
+{
+	int ret;
+
+	if (!(wl->quirks & WLCORE_QUIRK_REGDOMAIN_CONF))
+		return;
+
+	mutex_lock(&wl->mutex);
+	ret = wl1271_ps_elp_wakeup(wl);
+	if (ret < 0)
+		goto out;
+
+	ret = wlcore_cmd_regdomain_config_locked(wl);
+	if (ret < 0) {
+		wl12xx_queue_recovery_work(wl);
+		goto out;
+	}
+
+	wl1271_ps_elp_sleep(wl);
+out:
+	mutex_unlock(&wl->mutex);
 }
 
 static int wl1271_op_hw_scan(struct ieee80211_hw *hw,
@@ -4088,13 +4182,10 @@ static void wl1271_bss_info_changed_sta(struct wl1271 *wl,
 
 		do_join = true;
 	}
-/*
-	if (changed & BSS_CHANGED_IDLE && !is_ibss) {
-		ret = wl1271_sta_handle_idle(wl, wlvif, bss_conf->idle);
-		if (ret < 0)
-			wl1271_warning("idle mode change failed %d", ret);
-	}
-*/
+
+	if (changed & BSS_CHANGED_IDLE && !is_ibss)
+		wl1271_sta_handle_idle(wl, wlvif, bss_conf->idle);
+
 	if ((changed & BSS_CHANGED_CQM)) {
 		bool enable = false;
 		if (bss_conf->cqm_rssi_thold)
@@ -4813,17 +4904,17 @@ static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 
 	if (wlvif->bss_type == BSS_TYPE_STA_BSS) {
 		hlid = wlvif->sta.hlid;
-		ba_bitmap = &wlvif->sta.ba_rx_bitmap;
 	} else if (wlvif->bss_type == BSS_TYPE_AP_BSS) {
 		struct wl1271_station *wl_sta;
 
 		wl_sta = (struct wl1271_station *)sta->drv_priv;
 		hlid = wl_sta->hlid;
-		ba_bitmap = &wl->links[hlid].ba_bitmap;
 	} else {
 		ret = -EINVAL;
 		goto out;
 	}
+
+	ba_bitmap = &wl->links[hlid].ba_bitmap;
 
 	ret = wl1271_ps_elp_wakeup(wl);
 	if (ret < 0)
@@ -5197,7 +5288,7 @@ static int wl12xx_op_set_priority(struct ieee80211_hw *hw,
 		goto out_sleep;
 	}
 
-	ret = wl12xx_roc(wl, wlvif, wlvif->role_id, wlvif->channel);
+	ret = wl12xx_roc(wl, wlvif, wlvif->role_id, wlvif->band, wlvif->channel);
 
 out_sleep:
 	wl1271_ps_elp_sleep(wl);
@@ -5832,7 +5923,8 @@ static int wl1271_init_ieee80211(struct wl1271 *wl)
 		IEEE80211_HW_AP_LINK_PS |
 		IEEE80211_HW_AMPDU_AGGREGATION |
 		IEEE80211_HW_TX_AMPDU_SETUP_IN_HW |
-		IEEE80211_HW_SCAN_WHILE_IDLE;
+		IEEE80211_HW_SCAN_WHILE_IDLE |
+		IEEE80211_HW_QUEUE_CONTROL;
 
 	wl->hw->wiphy->cipher_suites = cipher_suites;
 	wl->hw->wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
@@ -5899,7 +5991,14 @@ static int wl1271_init_ieee80211(struct wl1271 *wl)
 	wl->hw->wiphy->bands[IEEE80211_BAND_5GHZ] =
 		&wl->bands[IEEE80211_BAND_5GHZ];
 
-	wl->hw->queues = 4;
+	/*
+	 * allow 4 queues per mac address we support +
+	 * 1 cab queue per mac + one global offchannel Tx queue
+	 */
+	wl->hw->queues = (NUM_TX_QUEUES + 1) * WLCORE_NUM_MAC_ADDRESSES + 1;
+
+	/* the last queue is the offchannel queue */
+	wl->hw->offchannel_tx_hw_queue = wl->hw->queues - 1;
 	wl->hw->max_rates = 1;
 
 	wl->hw->wiphy->reg_notifier = wl1271_reg_notify;
@@ -5996,6 +6095,7 @@ struct ieee80211_hw *wlcore_alloc_hw(size_t priv_size, u32 aggr_buf_size,
 	wl->platform_quirks = 0;
 	wl->system_hlid = WL12XX_SYSTEM_HLID;
 	wl->active_sta_count = 0;
+	wl->active_link_count = 0;
 	wl->fwlog_size = 0;
 	init_waitqueue_head(&wl->fwlog_waitq);
 
@@ -6052,7 +6152,17 @@ struct ieee80211_hw *wlcore_alloc_hw(size_t priv_size, u32 aggr_buf_size,
 		ret = -ENOMEM;
 		goto err_fwlog;
 	}
+
+	wl->buffer_32 = kmalloc(sizeof(u32), GFP_KERNEL);
+	if (!wl->buffer_32) {
+		ret = -ENOMEM;
+		goto err_mbox;
+	}
+
 	return hw;
+
+err_mbox:
+	kfree(wl->mbox);
 
 err_fwlog:
 	free_page((unsigned long)wl->fwlog);
@@ -6097,6 +6207,8 @@ int wlcore_free_hw(struct wl1271 *wl)
 	device_remove_file(wl->dev, &dev_attr_hw_pg_ver);
 
 	device_remove_file(wl->dev, &dev_attr_bt_coex_state);
+	kfree(wl->buffer_32);
+	kfree(wl->mbox);
 	free_page((unsigned long)wl->fwlog);
 	dev_kfree_skb(wl->dummy_packet);
 	free_pages((unsigned long)wl->aggr_buf, get_order(wl->aggr_buf_size));
@@ -6165,8 +6277,16 @@ int __devinit wlcore_probe(struct wl1271 *wl, struct platform_device *pdev)
 
 	if (!wl->ops || !wl->ptable) {
 		ret = -EINVAL;
-		goto out_free_hw;
+		goto out;
 	}
+
+	wl->dev = &pdev->dev;
+	wl->pdev = pdev;
+	platform_set_drvdata(pdev, wl);
+
+	ret = wl->ops->setup(wl);
+	if (ret < 0)
+		goto out;
 
 	BUG_ON(wl->num_tx_desc > WLCORE_MAX_TX_DESCRIPTORS);
 
@@ -6176,10 +6296,7 @@ int __devinit wlcore_probe(struct wl1271 *wl, struct platform_device *pdev)
 	wl->irq = platform_get_irq(pdev, 0);
 	wl->platform_quirks = pdata->platform_quirks;
 	wl->set_power = pdata->set_power;
-	wl->dev = &pdev->dev;
 	wl->if_ops = pdata->ops;
-
-	platform_set_drvdata(pdev, wl);
 
 	if (wl->platform_quirks & WL12XX_PLATFORM_QUIRK_EDGE_IRQ)
 		irqflags = IRQF_TRIGGER_RISING;
@@ -6191,7 +6308,7 @@ int __devinit wlcore_probe(struct wl1271 *wl, struct platform_device *pdev)
 				   pdev->name, wl);
 	if (ret < 0) {
 		wl1271_error("request_irq() failed: %d", ret);
-		goto out_free_hw;
+		goto out;
 	}
 
 #ifdef CONFIG_PM
@@ -6265,9 +6382,6 @@ out_unreg:
 
 out_irq:
 	free_irq(wl->irq, wl);
-
-out_free_hw:
-	wlcore_free_hw(wl);
 
 out:
 	return ret;

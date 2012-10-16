@@ -512,6 +512,7 @@ int wlcore_boot_run_firmware(struct wl1271 *wl)
 		SCAN_COMPLETE_EVENT_ID |
 		RSSI_SNR_TRIGGER_0_EVENT_ID |
 		PERIODIC_SCAN_COMPLETE_EVENT_ID |
+		PERIODIC_SCAN_REPORT_EVENT_ID |
 		DUMMY_PACKET_EVENT_ID |
 		PEER_REMOVE_COMPLETE_EVENT_ID |
 		BA_SESSION_RX_CONSTRAINT_EVENT_ID |
@@ -519,6 +520,9 @@ int wlcore_boot_run_firmware(struct wl1271 *wl)
 		INACTIVE_STA_EVENT_ID |
 		MAX_TX_FAILURE_EVENT_ID |
 		CHANNEL_SWITCH_COMPLETE_EVENT_ID;
+
+	/* unmask specific family mbox events  */
+	wl->event_mask |= wl->chip_family_event_mask;
 
 	ret = wl1271_event_unmask(wl);
 	if (ret < 0) {
