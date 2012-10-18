@@ -58,13 +58,13 @@ echo "Copying over WL7 (wl12xx) modules..."
 echo ""
 
 # Copy WL7 modules
-dd if=$WL7_MODULES_PATH/cfg80211.ko of=$MODULES_PATH/cfg80211.ko
+ln -s $WL7_MODULES_PATH/cfg80211.ko $MODULES_PATH/cfg80211.ko
 chmod 644 $MODULES_PATH/cfg80211.ko
-dd if=$WL7_MODULES_PATH/mac80211.ko of=$MODULES_PATH/mac80211.ko
+ln -s $WL7_MODULES_PATH/mac80211.ko $MODULES_PATH/mac80211.ko
 chmod 644 $MODULES_PATH/mac80211.ko
-dd if=$WL7_MODULES_PATH/wl12xx.ko of=$MODULES_PATH/wl12xx.ko
+ln -s $WL7_MODULES_PATH/wl12xx.ko $MODULES_PATH/wl12xx.ko
 chmod 644 $MODULES_PATH/wl12xx.ko
-dd if=$WL7_MODULES_PATH/wl12xx_sdio.ko of=$MODULES_PATH/wlcore_sdio.ko
+ln -s $WL7_MODULES_PATH/wl12xx_sdio.ko $MODULES_PATH/wlcore_sdio.ko
 chmod 644 $MODULES_PATH/wlcore_sdio.ko
 sleep 2
 sync
