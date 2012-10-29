@@ -17,6 +17,19 @@
 
 #define DEBUGFS_FORMAT_BUFFER_SIZE 100
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,4,0))
+#include <linux/fs.h>
+#include <linux/module.h>
+int simple_open(struct inode *inode, struct file *file)
+{
+	if (inode->i_private)
+		file->private_data = inode->i_private;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(simple_open);
+#endif
+
+
 int mac80211_format_buffer(char __user *userbuf, size_t count,
 				  loff_t *ppos, char *fmt, ...)
 {
