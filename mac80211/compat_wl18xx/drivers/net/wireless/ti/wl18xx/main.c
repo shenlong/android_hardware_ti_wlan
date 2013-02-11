@@ -546,6 +546,11 @@ static struct wl18xx_priv_conf wl18xx_default_priv_conf = {
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
 		.pwr_limit_reference_11p	= 0x64,
+		.per_chan_bo_mode_11_abg	= { 0x00, 0x00, 0x00, 0x00,
+						    0x00, 0x00, 0x00, 0x00,
+						    0x00, 0x00, 0x00, 0x00,
+						    0x00 },
+		.per_chan_bo_mode_11_p		= { 0x00, 0x00, 0x00, 0x00 },
 		.per_chan_pwr_limit_arr_11p	= { 0xff, 0xff, 0xff, 0xff,
 						    0xff, 0xff, 0xff },
 		.psat				= 0,
@@ -1132,8 +1137,9 @@ static u32 wl18xx_ap_get_mimo_wide_rate_mask(struct wl1271 *wl,
 		wl1271_debug(DEBUG_ACX, "using wide channel rate mask");
 
 		/* sanity check - we don't support this */
-		if (WARN_ON(wlvif->band != IEEE80211_BAND_5GHZ))
-			return 0;
+		if (wlvif->band != IEEE80211_BAND_5GHZ)
+			wl1271_error("using 40Mhz AP in 2.4Ghz band -"
+				     "not officially supported");
 
 		return CONF_TX_RATE_USE_WIDE_CHAN;
 	} else if (wl18xx_is_mimo_supported(wl) &&
@@ -1152,6 +1158,7 @@ static u32 wl18xx_ap_get_mimo_wide_rate_mask(struct wl1271 *wl,
 static int wl18xx_get_pg_ver(struct wl1271 *wl, s8 *ver)
 {
 	u32 fuse;
+	s8 rom = 0, metal = 0, pg_ver = 0, rdl_ver = 0;
 	int ret;
 
 	ret = wlcore_set_partition(wl, &wl->ptable[PART_TOP_PRCM_ELP_SOC]);
@@ -1162,8 +1169,29 @@ static int wl18xx_get_pg_ver(struct wl1271 *wl, s8 *ver)
 	if (ret < 0)
 		goto out;
 
+	pg_ver = (fuse & WL18XX_PG_VER_MASK) >> WL18XX_PG_VER_OFFSET;
+	rom = (fuse & WL18XX_ROM_VER_MASK) >> WL18XX_ROM_VER_OFFSET;
+
+	if (rom <= 0xE)
+		metal = (fuse & WL18XX_METAL_VER_MASK) >>
+			WL18XX_METAL_VER_OFFSET;
+	else
+		metal = (fuse & WL18XX_NEW_METAL_VER_MASK) >>
+			WL18XX_NEW_METAL_VER_OFFSET;
+
+	ret = wlcore_read32(wl, WL18XX_REG_FUSE_DATA_2_3, &fuse);
+	if (ret < 0)
+		goto out;
+
+	rdl_ver = (fuse & WL18XX_RDL_VER_MASK) >> WL18XX_RDL_VER_OFFSET;
+	if (rdl_ver > RDL_MAX)
+		rdl_ver = RDL_NONE;
+
+	wl1271_info("wl18xx HW: RDL %d, %s, PG %x.%x (ROM %x)",
+		    rdl_ver, rdl_names[rdl_ver], pg_ver, metal, rom);
+
 	if (ver)
-		*ver = (fuse & WL18XX_PG_VER_MASK) >> WL18XX_PG_VER_OFFSET;
+		*ver = pg_ver;
 
 	ret = wlcore_set_partition(wl, &wl->ptable[PART_BOOT]);
 
@@ -1270,6 +1298,12 @@ static int wl18xx_get_mac(struct wl1271 *wl)
 	wl->fuse_oui_addr = ((mac2 & 0xffff) << 8) +
 		((mac1 & 0xff000000) >> 24);
 	wl->fuse_nic_addr = (mac1 & 0xffffff);
+
+	if (!wl->fuse_oui_addr && !wl->fuse_nic_addr) {
+		wl->fuse_oui_addr = WL18XX_DEFAULT_OUI_ADDR;
+		wl1271_warning("wl18xx_get_mac: untrimmed device, "
+			       "use default oui address");
+	}
 
 	ret = wlcore_set_partition(wl, &wl->ptable[PART_DOWN]);
 

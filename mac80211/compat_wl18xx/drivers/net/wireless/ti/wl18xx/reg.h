@@ -131,6 +131,16 @@
 #define WL18XX_REG_FUSE_DATA_1_3	0xA0260C
 #define WL18XX_PG_VER_MASK		0x70
 #define WL18XX_PG_VER_OFFSET		4
+#define WL18XX_ROM_VER_MASK		0x3
+#define WL18XX_ROM_VER_OFFSET		0
+#define WL18XX_METAL_VER_MASK		0xC
+#define WL18XX_METAL_VER_OFFSET		2
+#define WL18XX_NEW_METAL_VER_MASK	0x180
+#define WL18XX_NEW_METAL_VER_OFFSET	7
+
+#define WL18XX_REG_FUSE_DATA_2_3	0xA02614
+#define WL18XX_RDL_VER_MASK		0x1f00
+#define WL18XX_RDL_VER_OFFSET		8
 
 #define WL18XX_REG_FUSE_BD_ADDR_1	0xA02602
 #define WL18XX_REG_FUSE_BD_ADDR_2	0xA02606
@@ -141,6 +151,8 @@
 
 #define CHIP_ID_185x_PG10              (0x06030101)
 #define CHIP_ID_185x_PG20              (0x06030111)
+
+#define WL18XX_DEFAULT_OUI_ADDR		(0x080028)
 
 /*
  * Host Command Interrupt. Setting this bit masks
@@ -186,6 +198,25 @@ enum {
 	BOARD_TYPE_COM8_18XX    = 4,
 
 	NUM_BOARD_TYPES,
+};
+
+enum {
+	RDL_NONE	= 0,
+	RDL_1_HP	= 1,
+	RDL_2_SP	= 2,
+	RDL_3_HP	= 3,
+	RDL_4_SP	= 4,
+
+	_RDL_LAST,
+	RDL_MAX = _RDL_LAST - 1,
+};
+
+static const char * const rdl_names[] = {
+	[RDL_NONE]	= "",
+	[RDL_1_HP]	= "1853 SISO",
+	[RDL_2_SP]	= "1857 MIMO",
+	[RDL_3_HP]	= "1893 SISO",
+	[RDL_4_SP]	= "1897 MIMO",
 };
 
 /*

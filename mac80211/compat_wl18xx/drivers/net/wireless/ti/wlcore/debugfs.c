@@ -460,7 +460,9 @@ static ssize_t stats_tx_aggr_write(struct file *file,
 	if (unlikely(wl->state != WLCORE_STATE_ON))
 		goto out;
 
-	memset(wl->aggr_pkts_reason, 0, sizeof(wl->aggr_pkts_reason));
+	wl1271_info("zeroing out aggr pkts reasons");
+	memset(wl->aggr_pkts_reason, 0,
+	       sizeof(struct wlcore_aggr_reason) * wl->aggr_pkts_reason_num);
 
 out:
 	mutex_unlock(&wl->mutex);
@@ -691,8 +693,7 @@ static ssize_t vifs_state_read(struct file *file, char __user *user_buf,
 		VIF_STATE_PRINT_INT(last_rssi_event);
 		VIF_STATE_PRINT_INT(ba_support);
 		VIF_STATE_PRINT_INT(ba_allowed);
-		VIF_STATE_PRINT_LLHEX(tx_security_seq);
-		VIF_STATE_PRINT_INT(tx_security_last_seq_lsb);
+		VIF_STATE_PRINT_LLHEX(total_freed_pkts);
 	}
 
 #undef VIF_STATE_PRINT_INT

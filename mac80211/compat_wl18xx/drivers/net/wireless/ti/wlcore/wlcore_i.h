@@ -284,6 +284,13 @@ struct wl1271_link {
 
 	/* The wlvif this link belongs to. Might be null for global links */
 	struct wl12xx_vif *wlvif;
+
+	/*
+	 * total freed FW packets on the link - used for tracking the AES/TKIP
+	 * PN across recoveries. Re-initialized each time from the wl1271_station
+	 * structure.
+	 */
+	u64 total_freed_pkts;
 };
 
 #define WL1271_MAX_RX_FILTERS 5
@@ -328,6 +335,14 @@ struct wl12xx_rx_filter {
 
 struct wl1271_station {
 	u8 hlid;
+	bool in_connection;
+
+	/*
+	 * total freed FW packets on the link to the STA - used for tracking the
+	 * AES/TKIP PN across recoveries. Re-initialized each time from the
+	 * wl1271_station structure.
+	 */
+	u64 total_freed_pkts;
 };
 
 struct wl12xx_vif {
@@ -440,8 +455,6 @@ struct wl12xx_vif {
 	struct delayed_work channel_switch_work;
 	struct delayed_work connection_loss_work;
 
-	bool pending_roc;
-
 	/*
 	 * This vif's queues are mapped to mac80211 HW queues as:
 	 * VO - hw_queue_base
@@ -451,6 +464,9 @@ struct wl12xx_vif {
 	 */
 	int hw_queue_base;
 
+	/* number of in connection stations */
+	int inconn_count;
+
 	/*
 	 * This struct must be last!
 	 * data that has to be saved acrossed reconfigs (e.g. recovery)
@@ -458,16 +474,14 @@ struct wl12xx_vif {
 	 */
 	struct {
 		u8 persistent[0];
-		/*
-		 * Security sequence number
-		 *     bits 0-15: lower 16 bits part of sequence number
-		 *     bits 16-47: higher 32 bits part of sequence number
-		 *     bits 48-63: not in use
-		 */
-		u64 tx_security_seq;
 
-		/* 8 bits of the last sequence number in use */
-		u8 tx_security_last_seq_lsb;
+		/*
+		 * total freed FW packets on the link - used for storing the AES/TKIP
+		 * PN during recovery, as this structure is not zeroed out.
+		 * For STA this holds the PN of the link to the AP.
+		 * For AP this holds the PN of the broadcast link.
+		 */
+		u64 total_freed_pkts;
 	};
 };
 
